@@ -1,5 +1,4 @@
-openai==2.31.0
+﻿openai==2.31.0
 PyAudio==0.2.14
-pyttsx3==2.99
 vosk==0.3.45
 pvporcupine==4.0.2
