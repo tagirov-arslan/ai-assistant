@@ -1,0 +1,16 @@
+.env
+assistant_settings.json
+
+.venv/
+.venv-win/
+.uv-cache/
+__pycache__/
+*.py[cod]
+
+models/
+supertonic-3-model/
+supertonic_test.wav
+vosk api/
+
+.idea/
+*.lnk

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import threading
@@ -14,22 +14,21 @@ from speech_module import SpeechConfig, SpeechModule
 LM_CONFIG = LMStudioConfig(
     base_url="http://127.0.0.1:1234",
     api_key="lm-studio",
-    model="google/gemma-4-e2b",
+    model="qwen/qwen3.6-35b-a3b",
     temperature=0.7,
-    max_tokens=300,
+    max_tokens=2000,
     system_prompt="Ты полезный ИИ-ассистент. Отвечай кратко, понятно и на русском языке.",
 )
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "assistant_settings.json"
-ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 
 class AssistantApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("ИИ-ассистент")
-        self.root.geometry("1080x720")
-        self.root.minsize(900, 620)
+        self.root.geometry("1120x820")
+        self.root.minsize(1040, 760)
         self.root.configure(bg="#dfe7f1")
 
         self._configure_styles()
@@ -48,14 +47,16 @@ class AssistantApp:
         self.voice_var = tk.StringVar(value=self.speech_module.get_tts_status_label())
 
         self._build_ui()
+        self.root.update_idletasks()
 
         self.add_message("assistant", "Здравствуйте! Напишите сообщение или используйте голосовой ввод.")
         self.add_message("system", f"Активный микрофон: {self.speech_module.get_input_device_label()}")
+        self.add_message("system", f"Распознавание: {self.speech_module.get_stt_status_label()}")
         self.add_message("system", f"Озвучивание: {self.speech_module.get_tts_status_label()}")
         if not self.speech_module.tts_available:
             self.add_message(
                 "system",
-                f"API key хранится в {ENV_PATH.name}, а voice_id и модель задаются в {SETTINGS_PATH.name}.",
+                "Для Supertonic 3 установите пакет supertonic. Настройки голоса хранятся в assistant_settings.json.",
             )
 
     def _configure_styles(self) -> None:
@@ -117,7 +118,7 @@ class AssistantApp:
             "Primary.TButton",
             background="#2b6be6",
             foreground="#ffffff",
-            padding=(16, 10),
+            padding=(14, 8),
             borderwidth=0,
             focusthickness=0,
             focuscolor="#2b6be6",
@@ -131,7 +132,7 @@ class AssistantApp:
             "Secondary.TButton",
             background="#eef3f8",
             foreground="#203142",
-            padding=(14, 10),
+            padding=(12, 8),
             borderwidth=0,
             focusthickness=0,
             focuscolor="#eef3f8",
@@ -145,7 +146,7 @@ class AssistantApp:
             "Ghost.TButton",
             background="#243140",
             foreground="#ffffff",
-            padding=(14, 10),
+            padding=(12, 8),
             borderwidth=0,
             focusthickness=0,
             focuscolor="#243140",
@@ -159,9 +160,10 @@ class AssistantApp:
     def _default_settings(self) -> dict[str, object]:
         return {
             "input_device_index": None,
-            "elevenlabs_voice_id": "",
-            "elevenlabs_model_id": "eleven_multilingual_v2",
-            "elevenlabs_output_format": "pcm_24000",
+            "supertonic_voice": "F1",
+            "supertonic_lang": "ru",
+            "supertonic_steps": 8,
+            "supertonic_speed": 1.0,
         }
 
     def _load_settings(self) -> dict[str, object]:
@@ -176,10 +178,17 @@ class AssistantApp:
 
         if isinstance(raw.get("input_device_index"), int):
             settings["input_device_index"] = raw["input_device_index"]
-        for key in ["elevenlabs_voice_id", "elevenlabs_model_id", "elevenlabs_output_format"]:
+        for key in [
+            "supertonic_voice",
+            "supertonic_lang",
+        ]:
             value = raw.get(key)
             if isinstance(value, str):
                 settings[key] = value
+        if isinstance(raw.get("supertonic_steps"), int):
+            settings["supertonic_steps"] = raw["supertonic_steps"]
+        if isinstance(raw.get("supertonic_speed"), (int, float)):
+            settings["supertonic_speed"] = float(raw["supertonic_speed"])
         return settings
 
     def _save_settings(self) -> None:
@@ -192,14 +201,17 @@ class AssistantApp:
                 if isinstance(self.settings.get("input_device_index"), int)
                 else None
             ),
-            elevenlabs_voice_id=str(self.settings.get("elevenlabs_voice_id", "")),
-            elevenlabs_model_id=(
-                str(self.settings.get("elevenlabs_model_id", "eleven_multilingual_v2"))
-                or "eleven_multilingual_v2"
+            supertonic_voice=str(self.settings.get("supertonic_voice", "F1")) or "F1",
+            supertonic_lang=str(self.settings.get("supertonic_lang", "ru")) or "ru",
+            supertonic_steps=(
+                int(self.settings.get("supertonic_steps", 8))
+                if isinstance(self.settings.get("supertonic_steps"), int)
+                else 8
             ),
-            elevenlabs_output_format=(
-                str(self.settings.get("elevenlabs_output_format", "pcm_24000"))
-                or "pcm_24000"
+            supertonic_speed=(
+                float(self.settings.get("supertonic_speed", 1.0))
+                if isinstance(self.settings.get("supertonic_speed"), (int, float))
+                else 1.0
             ),
         )
 
@@ -239,9 +251,13 @@ class AssistantApp:
             pady=(8, 0),
         )
 
-        ttk.Button(sidebar, text="Выбрать микрофон", style="Ghost.TButton", command=self.open_microphone_dialog).pack(
+        ttk.Button(sidebar, text="Выбрать голос", style="Ghost.TButton", command=self.open_voice_dialog).pack(
             fill=tk.X,
             pady=(6, 0),
+        )
+        ttk.Button(sidebar, text="Выбрать микрофон", style="Ghost.TButton", command=self.open_microphone_dialog).pack(
+            fill=tk.X,
+            pady=(10, 0),
         )
         ttk.Button(sidebar, text="Очистить диалог", style="Ghost.TButton", command=self.clear_chat).pack(
             fill=tk.X,
@@ -272,14 +288,14 @@ class AssistantApp:
         self.chat_area.pack(fill=tk.BOTH, expand=True)
         self._configure_chat_tags()
 
-        composer_shell = ttk.Frame(main, style="Composer.TFrame", padding=(18, 14))
-        composer_shell.pack(fill=tk.X, padx=18, pady=(0, 18))
+        composer_shell = ttk.Frame(main, style="Composer.TFrame", padding=(18, 10))
+        composer_shell.pack(fill=tk.X, padx=18, pady=(0, 12))
 
         composer_row = ttk.Frame(composer_shell, style="Composer.TFrame")
         composer_row.pack(fill=tk.X)
 
         self.input_entry = ttk.Entry(composer_row, font=("Segoe UI", 11))
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12), ipady=8)
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), ipady=6)
         self.input_entry.bind("<Return>", lambda event: self.handle_send())
         self.input_entry.focus_set()
 
@@ -300,7 +316,7 @@ class AssistantApp:
         )
         ttk.Button(actions, text="Очистить", style="Secondary.TButton", command=self.clear_chat).pack(side=tk.LEFT)
 
-        ttk.Label(composer_shell, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", pady=(12, 0))
+        ttk.Label(composer_shell, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", pady=(8, 0))
 
     def _configure_chat_tags(self) -> None:
         self.chat_area.tag_configure(
@@ -371,6 +387,71 @@ class AssistantApp:
     def _refresh_device_labels(self) -> None:
         self.mic_var.set(self.speech_module.get_input_device_label())
         self.voice_var.set(self.speech_module.get_tts_status_label())
+
+    def _available_supertonic_voices(self) -> list[str]:
+        voices_dir = Path(__file__).resolve().parent / "supertonic-3-model" / "voice_styles"
+        if voices_dir.exists():
+            voices = sorted(path.stem for path in voices_dir.glob("*.json"))
+            if voices:
+                return voices
+        return ["F1", "F2", "F3", "F4", "M1", "M2", "M3", "M4"]
+
+    def open_voice_dialog(self) -> None:
+        voices = self._available_supertonic_voices()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Выбор голоса")
+        dialog.geometry("520x300")
+        dialog.configure(bg="#dfe7f1")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        shell = ttk.Frame(dialog, style="DialogCard.TFrame", padding=18)
+        shell.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        ttk.Label(shell, text="Выбор голоса", style="TopTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            shell,
+            text=f"Текущий голос: {self.settings.get('supertonic_voice', 'F1')}",
+            style="TopSub.TLabel",
+            wraplength=460,
+        ).pack(anchor="w", pady=(6, 14))
+
+        selected_voice = tk.StringVar(value=str(self.settings.get("supertonic_voice", "F1")))
+        combo = ttk.Combobox(shell, textvariable=selected_voice, values=voices, state="readonly")
+        combo.pack(fill=tk.X)
+
+        ttk.Label(
+            shell,
+            text="После сохранения этот голос будет использоваться для озвучивания ответов ассистента.",
+            style="TopSub.TLabel",
+            wraplength=460,
+        ).pack(anchor="w", pady=(14, 0))
+
+        buttons = ttk.Frame(shell, style="DialogCard.TFrame")
+        buttons.pack(fill=tk.X, pady=(18, 0))
+
+        def rebuild_speech_module(voice: str) -> None:
+            self.speech_module.stop_speaking()
+            self.settings["supertonic_voice"] = voice
+            self.speech_module.config.supertonic_voice = voice
+            self.speech_module.supertonic_voice_style = None
+
+
+        def save_selection() -> None:
+            voice = selected_voice.get().strip() or "F1"
+            rebuild_speech_module(voice)
+            self._save_settings()
+            self._refresh_device_labels()
+            self.add_message("system", f"Выбран голос озвучивания: {voice}")
+            self._set_status("Голос обновлён")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Сохранить", style="Primary.TButton", command=save_selection).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Отмена", style="Secondary.TButton", command=dialog.destroy).pack(
+            side=tk.RIGHT,
+            padx=(0, 8),
+        )
 
     def open_microphone_dialog(self) -> None:
         devices = self.speech_module.list_input_devices()
@@ -503,7 +584,6 @@ class AssistantApp:
 
                 def process_voice() -> None:
                     self._clear_input()
-                    self.input_entry.insert(0, text)
                     self.add_message("user", text)
                     self._set_status("Обрабатываю голосовой запрос...")
 
@@ -550,3 +630,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
