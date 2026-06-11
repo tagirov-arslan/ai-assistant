@@ -478,6 +478,22 @@ class AssistantApp:
             wraplength=660,
         ).pack(anchor="w", pady=(6, 14))
 
+        def device_score(device: dict[str, object]) -> int:
+            name = str(device["name"]).lower()
+            value = 0
+
+            preferred = ["microphone", "микрофон", "mic input", "array"]
+            avoided = ["line in", "line-in", "линейный", "лин. вход", "stereo mix", "стерео микшер", "speaker"]
+
+            for token in preferred:
+                if token in name:
+                    value += 10
+            for token in avoided:
+                if token in name:
+                    value -= 12
+            return value
+
+        devices = sorted(devices, key=device_score, reverse=True)
         values = [
             f"{device['index']} | {device['name']} | {device['default_sample_rate']} Hz"
             for device in devices
@@ -604,8 +620,9 @@ class AssistantApp:
                 self.root.after(0, process_voice)
 
             except Exception as error:
+                error_message = str(error)
                 self.root.after(0, lambda: self._set_status("Готово к работе"))
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", str(error)))
+                self.root.after(0, lambda: messagebox.showerror("Ошибка", error_message))
 
         threading.Thread(target=worker, daemon=True).start()
 

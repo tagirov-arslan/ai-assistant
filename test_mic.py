@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import time
 
-from vosk import KaldiRecognizer
-
 from speech_module import SpeechConfig, SpeechModule
 
 
@@ -19,50 +17,26 @@ def main() -> None:
     args = parse_args()
     module = SpeechModule(SpeechConfig(input_device_index=args.device_index))
 
-    if args.list_devices:
-        print("Доступные входные устройства:")
-        for device in module.list_input_devices():
-            print(device)
-        module.shutdown()
-        return
-
-    recognizer = KaldiRecognizer(module.vosk_model, float(module.active_sample_rate))
-    recognizer.SetWords(True)
-
-    print(f"Активный микрофон: {module.get_input_device_label()}")
-    print("Диагностика запущена. Говорите 8-10 секунд обычным голосом.")
-    print("Будут показаны уровни сигнала и промежуточное распознавание Vosk.")
-    print("")
-
-    started_at = time.monotonic()
-    last_partial = ""
-
     try:
-        with module._open_input_stream(  # noqa: SLF001
-            sample_rate=module.active_sample_rate,
-            frames_per_buffer=module.config.chunk_size,
-        ) as stream:
-            while time.monotonic() - started_at < 10:
-                data = stream.read(module.config.chunk_size, exception_on_overflow=False)
-                energy = module._estimate_energy(data)  # noqa: SLF001
+        if args.list_devices:
+            print("Доступные входные устройства:")
+            for device in module.list_input_devices():
+                print(device)
+            return
 
-                if recognizer.AcceptWaveform(data):
-                    text = module._extract_text(recognizer.Result())  # noqa: SLF001
-                    print(f"[final] energy={energy:>4} text={text!r}")
-                else:
-                    partial = module._extract_partial(recognizer.PartialResult())  # noqa: SLF001
-                    if partial and partial != last_partial:
-                        last_partial = partial
-                        print(f"[partial] energy={energy:>4} text={partial!r}")
-                    else:
-                        print(f"[level] energy={energy:>4}")
-
-        final_text = module._extract_text(recognizer.FinalResult())  # noqa: SLF001
+        print(f"Активный микрофон: {module.get_input_device_label()}")
+        print(f"Распознавание: {module.get_stt_status_label()}")
+        print("Диагностика запущена. После паузы распознавание завершится автоматически.")
         print("")
-        print(f"Итоговый текст: {final_text!r}")
+
+        started_at = time.monotonic()
+        text = module.speech_to_text()
+        elapsed = time.monotonic() - started_at
+
+        print(f"Итоговый текст: {text!r}")
+        print(f"Время записи и распознавания: {elapsed:.2f} c")
         print(f"Порог начала речи в модуле: {module.config.energy_threshold}")
-        print("Если energy почти всегда маленький, проблема в сигнале микрофона.")
-        print("Если energy высокий, но text пустой, проблема уже в распознавании Vosk.")
+        print("Если текст пустой или искажён, проверьте микрофон и модель в AI_ASSISTANT_WHISPER_MODEL.")
     finally:
         module.shutdown()
 

@@ -7,10 +7,10 @@ assistant_settings.json
 __pycache__/
 *.py[cod]
 
-models/
 supertonic-3-model/
 supertonic_test.wav
-vosk api/
+whisper-large-v3-turbo/
+whisper-large-v3-turbo-ct2/
 
 .idea/
 *.lnk

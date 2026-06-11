@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import json
 import os
 import tempfile
 import threading
@@ -10,7 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyaudio
-from vosk import KaldiRecognizer, Model, SetLogLevel
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:  # optional local STT backend
+    WhisperModel = None
 
 try:
     from supertonic import TTS as SupertonicTTS
@@ -50,17 +53,39 @@ def _env_int(name: str) -> int | None:
         return None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on", "да"}
+
+
+def _default_whisper_model() -> str:
+    """Local CTranslate2 build of whisper-large-v3-turbo, with hub fallback."""
+    local_model = PROJECT_DIR / "whisper-large-v3-turbo-ct2"
+    if (local_model / "model.bin").exists():
+        return str(local_model)
+    return "large-v3-turbo"
+
+
 @dataclass
 class SpeechConfig:
     language: str = "ru-RU"
     sample_rate: int = 16000
-    chunk_size: int = 2000
+    chunk_size: int = 1024
     energy_threshold: int = 80
     phrase_time_limit_seconds: float = 8.0
-    silence_limit_seconds: float = 0.55
+    silence_limit_seconds: float = 0.45
     start_timeout_seconds: float = 5.0
     input_device_index: int | None = field(default_factory=lambda: _env_int("AI_ASSISTANT_INPUT_DEVICE_INDEX"))
-    vosk_model_path: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_VOSK_MODEL_PATH", "").strip())
+    stt_backend: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_STT_BACKEND", "faster_whisper").strip().lower() or "faster_whisper")
+    whisper_model: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_MODEL", "").strip() or _default_whisper_model())
+    whisper_device: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_DEVICE", "cpu").strip() or "cpu")
+    whisper_compute_type: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_COMPUTE_TYPE", "int8").strip() or "int8")
+    whisper_language: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_LANGUAGE", "ru").strip() or "ru")
+    whisper_beam_size: int = field(default_factory=lambda: _env_int("AI_ASSISTANT_WHISPER_BEAM_SIZE") or 1)
+    whisper_vad_filter: bool = field(default_factory=lambda: _env_bool("AI_ASSISTANT_WHISPER_VAD_FILTER", True))
+    whisper_initial_prompt: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_INITIAL_PROMPT", "").strip())
     supertonic_model_dir: str = field(default_factory=lambda: os.getenv("SUPERTONIC_MODEL_DIR", str(PROJECT_DIR / "supertonic-3-model")).strip())
     supertonic_voice: str = field(default_factory=lambda: os.getenv("SUPERTONIC_VOICE", "F1").strip() or "F1")
     supertonic_lang: str = field(default_factory=lambda: os.getenv("SUPERTONIC_LANG", "ru").strip() or "ru")
@@ -69,7 +94,7 @@ class SpeechConfig:
 
 
 class SpeechModule:
-    """Offline speech-to-text through Vosk and local text-to-speech through Supertonic 3."""
+    """Offline speech-to-text and local text-to-speech through Supertonic 3."""
 
     def __init__(self, config: SpeechConfig | None = None) -> None:
         self.config = config or SpeechConfig()
@@ -80,78 +105,42 @@ class SpeechModule:
         self.supertonic_voice_style = None
 
         self.tts_available = self._is_tts_available()
-
-        SetLogLevel(-1)
-        self.vosk_model_path = self._resolve_vosk_model_path(self.config.vosk_model_path)
-        self.vosk_model = self._load_vosk_model(self.vosk_model_path)
-        self.stt_available = self.vosk_model is not None
+        self.stt_backend = self.config.stt_backend
+        self.whisper_model = None
+        self.stt_available = self._is_stt_available()
         self.input_device_index, self.input_device_name, self.active_sample_rate = self._resolve_input_device()
 
     def speech_to_text(self) -> str:
-        if self.vosk_model is None:
-            raise RuntimeError("Vosk-модель не найдена. Укажите путь через AI_ASSISTANT_VOSK_MODEL_PATH.")
+        if self.stt_backend in {"faster_whisper", "whisper"}:
+            return self._speech_to_text_whisper()
+        raise RuntimeError(f"Неизвестный STT backend: {self.stt_backend}")
+
+    def _speech_to_text_whisper(self) -> str:
+        if WhisperModel is None:
+            raise RuntimeError("Пакет faster-whisper не установлен. Выполните: pip install faster-whisper")
         if self.input_device_index is None:
             raise RuntimeError("Микрофон не найден. Выберите доступное входное устройство.")
 
-        recognizer = KaldiRecognizer(self.vosk_model, float(self.active_sample_rate))
-        recognizer.SetWords(True)
+        audio_bytes = self._record_phrase()
+        if not audio_bytes:
+            raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
 
-        max_chunks = max(
-            1,
-            int(self.config.phrase_time_limit_seconds * self.active_sample_rate / self.config.chunk_size),
-        )
-        start_timeout_chunks = max(
-            1,
-            int(self.config.start_timeout_seconds * self.active_sample_rate / self.config.chunk_size),
-        )
-        silence_limit_chunks = max(
-            1,
-            int(self.config.silence_limit_seconds * self.active_sample_rate / self.config.chunk_size),
-        )
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            self._write_wav(temp_path, audio_bytes, self.active_sample_rate)
+            text = self._transcribe_whisper_file(temp_path)
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-        speech_started = False
-        silence_chunks = 0
-        collected_parts: list[str] = []
-        last_partial = ""
-
-        with self._open_input_stream(self.active_sample_rate, self.config.chunk_size) as stream:
-            for index in range(max_chunks):
-                data = stream.read(self.config.chunk_size, exception_on_overflow=False)
-                energy = self._estimate_energy(data)
-
-                if energy >= self.config.energy_threshold:
-                    speech_started = True
-                    silence_chunks = 0
-                elif speech_started:
-                    silence_chunks += 1
-
-                if recognizer.AcceptWaveform(data):
-                    text = self._extract_text(recognizer.Result())
-                    if text:
-                        self._append_unique_part(collected_parts, text)
-                        speech_started = True
-                else:
-                    partial = self._extract_partial(recognizer.PartialResult())
-                    if partial:
-                        last_partial = partial
-                        speech_started = True
-
-                if not speech_started and index >= start_timeout_chunks:
-                    raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
-
-                if speech_started and silence_chunks >= silence_limit_chunks:
-                    break
-
-        final_text = self._extract_text(recognizer.FinalResult())
-        if final_text:
-            self._append_unique_part(collected_parts, final_text)
-        elif last_partial:
-            self._append_unique_part(collected_parts, last_partial)
-
-        result = " ".join(part.strip() for part in collected_parts if part.strip()).strip()
-        result = self._collapse_repeated_phrase(result)
+        result = self._collapse_repeated_phrase(text)
         if not result:
-            raise RuntimeError("Не удалось распознать речь через Vosk.")
+            raise RuntimeError("Не удалось распознать речь через Whisper.")
         return result
 
     def text_to_speech(self, text: str) -> None:
@@ -192,9 +181,14 @@ class SpeechModule:
         )
 
     def get_stt_status_label(self) -> str:
-        if self.stt_available:
-            return f"Vosk: {self.vosk_model_path}"
-        return "Vosk: модель не найдена"
+        if self.stt_backend in {"faster_whisper", "whisper"}:
+            if WhisperModel is None:
+                return "Whisper: пакет faster-whisper не установлен"
+            return (
+                f"Whisper: {self.config.whisper_model} | "
+                f"{self.config.whisper_device}/{self.config.whisper_compute_type}"
+            )
+        return f"STT: неизвестный backend {self.stt_backend}"
 
     def set_input_device(self, device_index: int | None) -> None:
         previous_config_index = self.config.input_device_index
@@ -240,6 +234,89 @@ class SpeechModule:
 
     def _is_tts_available(self) -> bool:
         return SupertonicTTS is not None
+
+    def _is_stt_available(self) -> bool:
+        if self.stt_backend in {"faster_whisper", "whisper"}:
+            return WhisperModel is not None
+        return False
+
+    def _ensure_whisper_model(self) -> None:
+        if WhisperModel is None:
+            raise RuntimeError("Пакет faster-whisper не установлен. Выполните: pip install faster-whisper")
+        if self.whisper_model is None:
+            self.whisper_model = WhisperModel(
+                self.config.whisper_model,
+                device=self.config.whisper_device,
+                compute_type=self.config.whisper_compute_type,
+            )
+
+    def _record_phrase(self) -> bytes:
+        max_chunks = max(
+            1,
+            int(self.config.phrase_time_limit_seconds * self.active_sample_rate / self.config.chunk_size),
+        )
+        start_timeout_chunks = max(
+            1,
+            int(self.config.start_timeout_seconds * self.active_sample_rate / self.config.chunk_size),
+        )
+        silence_limit_chunks = max(
+            1,
+            int(self.config.silence_limit_seconds * self.active_sample_rate / self.config.chunk_size),
+        )
+
+        speech_started = False
+        silence_chunks = 0
+        frames: list[bytes] = []
+        pre_roll: list[bytes] = []
+        pre_roll_limit = max(1, int(0.25 * self.active_sample_rate / self.config.chunk_size))
+
+        with self._open_input_stream(self.active_sample_rate, self.config.chunk_size) as stream:
+            for index in range(max_chunks):
+                data = stream.read(self.config.chunk_size, exception_on_overflow=False)
+                energy = self._estimate_energy(data)
+
+                if not speech_started:
+                    pre_roll.append(data)
+                    if len(pre_roll) > pre_roll_limit:
+                        pre_roll.pop(0)
+
+                if energy >= self.config.energy_threshold:
+                    if not speech_started:
+                        speech_started = True
+                        frames.extend(pre_roll)
+                    frames.append(data)
+                    silence_chunks = 0
+                elif speech_started:
+                    frames.append(data)
+                    silence_chunks += 1
+
+                if not speech_started and index >= start_timeout_chunks:
+                    raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
+
+                if speech_started and silence_chunks >= silence_limit_chunks:
+                    break
+
+        return b"".join(frames)
+
+    def _write_wav(self, wav_path: Path, audio_bytes: bytes, sample_rate: int) -> None:
+        with wave.open(str(wav_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_bytes)
+
+    def _transcribe_whisper_file(self, wav_path: Path) -> str:
+        self._ensure_whisper_model()
+        segments, _info = self.whisper_model.transcribe(
+            str(wav_path),
+            language=self.config.whisper_language,
+            beam_size=max(1, self.config.whisper_beam_size),
+            vad_filter=self.config.whisper_vad_filter,
+            condition_on_previous_text=False,
+            initial_prompt=self.config.whisper_initial_prompt or None,
+            temperature=0.0,
+        )
+        return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
 
     def _ensure_supertonic_engine(self) -> None:
         if SupertonicTTS is None:
@@ -374,8 +451,19 @@ class SpeechModule:
             name = str(device["name"]).lower()
             value = 0
 
-            preferred = ["microphone", "микрофон", "mic input", "realtek", "array"]
-            avoided = ["stereo mix", "speaker", "output", "hands-free", "переназначение"]
+            preferred = ["microphone", "микрофон", "mic input", "array"]
+            avoided = [
+                "line in",
+                "line-in",
+                "линейный",
+                "лин. вход",
+                "stereo mix",
+                "стерео микшер",
+                "speaker",
+                "output",
+                "hands-free",
+                "переназначение",
+            ]
 
             for token in preferred:
                 if token in name:
@@ -433,62 +521,11 @@ class SpeechModule:
         except Exception:
             return False
 
-    def _resolve_vosk_model_path(self, explicit_path: str) -> Path | None:
-        candidates: list[Path] = []
-
-        if explicit_path:
-            candidates.append(Path(explicit_path))
-
-        candidates.extend(
-            [
-                PROJECT_DIR / "models" / "vosk-model-small-ru-0.22",
-                PROJECT_DIR / "resources" / "vosk" / "vosk-model-small-ru-0.22",
-                Path(r"C:\Users\Macinery_knr\Desktop\jarvis-master\resources\vosk\vosk-model-small-ru-0.22"),
-            ]
-        )
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-        return None
-
-    def _load_vosk_model(self, model_path: Path | None) -> Model | None:
-        if model_path is None:
-            return None
-        try:
-            return Model(str(model_path))
-        except Exception:
-            # Fail-safe for fresh PCs: keep text chat usable when the optional local STT model is missing or corrupt.
-            return None
-
     def _estimate_energy(self, audio_bytes: bytes) -> int:
         samples = memoryview(audio_bytes).cast("h")
         if not samples:
             return 0
         return int(sum(abs(sample) for sample in samples) / len(samples))
-
-    def _extract_text(self, payload: str) -> str:
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return ""
-        return str(data.get("text", "")).strip()
-
-    def _extract_partial(self, payload: str) -> str:
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return ""
-        return str(data.get("partial", "")).strip()
-
-    def _append_unique_part(self, parts: list[str], text: str) -> None:
-        normalized = self._normalize_text(text)
-        if not normalized:
-            return
-        if parts and self._normalize_text(parts[-1]) == normalized:
-            return
-        parts.append(text.strip())
 
     def _collapse_repeated_phrase(self, text: str) -> str:
         normalized = self._normalize_text(text)

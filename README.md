@@ -1,13 +1,13 @@
 # ИИ-ассистент для LM Studio
 
-Настольный русскоязычный ИИ-ассистент на `tkinter`. Приложение подключается к локальному серверу LM Studio через OpenAI-compatible API, принимает текстовые и голосовые запросы, распознаёт речь офлайн через Vosk и озвучивает ответы локальной моделью Supertonic 3.
+Настольный русскоязычный ИИ-ассистент на `tkinter`. Приложение подключается к локальному серверу LM Studio через OpenAI-compatible API, принимает текстовые и голосовые запросы, распознаёт речь локально через Whisper и озвучивает ответы локальной моделью Supertonic 3.
 
 ## Возможности
 
 - чат с локальной LLM из LM Studio;
 - текстовый ввод и отправка по `Enter`;
 - голосовой ввод с микрофона;
-- офлайн-распознавание русской речи через Vosk;
+- локальное распознавание русской речи через faster-whisper (whisper-large-v3-turbo);
 - локальная озвучка ответов через Supertonic 3;
 - выбор микрофона из интерфейса;
 - выбор голоса Supertonic из доступных `voice_styles`;
@@ -19,13 +19,13 @@
 ```text
 app.py                    # tkinter-интерфейс ассистента
 lm_studio_module.py       # HTTP-клиент для LM Studio /v1
-speech_module.py          # Vosk STT, Supertonic TTS, работа с PyAudio
+speech_module.py          # Whisper STT, Supertonic TTS, работа с PyAudio
 requirements.txt          # Python-зависимости
 assistant_settings.json   # локальные настройки микрофона и голоса
 .env.example              # пример локальных переменных окружения
 check_mic.py              # список входных аудиоустройств
-test_mic.py               # диагностика уровня сигнала и Vosk
-models/                   # локальные модели Vosk
+test_mic.py               # диагностика микрофона и локального STT
+whisper-large-v3-turbo-ct2/  # локальная STT-модель (CTranslate2) для faster-whisper
 supertonic-3-model/       # локальная модель и стили голосов Supertonic 3
 ```
 
@@ -35,7 +35,7 @@ supertonic-3-model/       # локальная модель и стили гол
 - Python 3.12 или совместимая версия Python 3;
 - рабочий микрофон;
 - LM Studio с включённым локальным API-сервером;
-- локальная модель Vosk, например `models/vosk-model-small-ru-0.22`;
+- локальная модель Whisper или доступ к уже скачанному кешу faster-whisper;
 - локальная модель Supertonic 3 в `supertonic-3-model`, если нужна озвучка.
 
 ## Установка
@@ -53,20 +53,29 @@ pip install -r requirements.txt
 
 ## Локальные модели
 
-### Vosk
+### Whisper
 
-По умолчанию приложение ищет модель распознавания в таком порядке:
+По умолчанию STT использует `faster-whisper` и локальную модель `whisper-large-v3-turbo-ct2` (CTranslate2-сборка whisper-large-v3-turbo, int8) на CPU. Если локальная папка с моделью отсутствует, используется имя `large-v3-turbo` — faster-whisper скачает модель в кеш при первом запуске.
 
-1. путь из переменной `AI_ASSISTANT_VOSK_MODEL_PATH`;
-2. `models/vosk-model-small-ru-0.22`;
-3. `resources/vosk/vosk-model-small-ru-0.22`;
-4. старый совместимый путь из предыдущей сборки проекта.
-
-Рекомендуемый вариант для этого репозитория:
-
-```text
-models/vosk-model-small-ru-0.22
+```env
+AI_ASSISTANT_STT_BACKEND=faster_whisper
+AI_ASSISTANT_WHISPER_MODEL=whisper-large-v3-turbo-ct2
+AI_ASSISTANT_WHISPER_DEVICE=cpu
+AI_ASSISTANT_WHISPER_COMPUTE_TYPE=int8
+AI_ASSISTANT_WHISPER_LANGUAGE=ru
+AI_ASSISTANT_WHISPER_BEAM_SIZE=1
+AI_ASSISTANT_WHISPER_VAD_FILTER=true
+AI_ASSISTANT_WHISPER_INITIAL_PROMPT=
 ```
+
+Если есть NVIDIA GPU, обычно быстрее использовать:
+
+```env
+AI_ASSISTANT_WHISPER_DEVICE=cuda
+AI_ASSISTANT_WHISPER_COMPUTE_TYPE=float16
+```
+
+Если Whisper искажает имена, команды или термины, добавьте их через `AI_ASSISTANT_WHISPER_INITIAL_PROMPT`.
 
 ### Supertonic 3
 
@@ -84,7 +93,14 @@ supertonic-3-model
 
 ```env
 AI_ASSISTANT_INPUT_DEVICE_INDEX=1
-AI_ASSISTANT_VOSK_MODEL_PATH=models/vosk-model-small-ru-0.22
+AI_ASSISTANT_STT_BACKEND=faster_whisper
+AI_ASSISTANT_WHISPER_MODEL=small
+AI_ASSISTANT_WHISPER_DEVICE=cpu
+AI_ASSISTANT_WHISPER_COMPUTE_TYPE=int8
+AI_ASSISTANT_WHISPER_LANGUAGE=ru
+AI_ASSISTANT_WHISPER_BEAM_SIZE=1
+AI_ASSISTANT_WHISPER_VAD_FILTER=true
+AI_ASSISTANT_WHISPER_INITIAL_PROMPT=
 SUPERTONIC_MODEL_DIR=supertonic-3-model
 SUPERTONIC_VOICE=F1
 SUPERTONIC_LANG=ru
@@ -107,6 +123,14 @@ SUPERTONIC_SPEED=1.0
 ```powershell
 .\.venv\Scripts\python.exe app.py
 ```
+
+На Windows также можно запустить готовый launcher:
+
+```powershell
+.\run_app.bat
+```
+
+Launcher использует проектное Windows-окружение `.venv-win`, а не случайный `python` из `PATH`.
 
 Текущая конфигурация по умолчанию в коде:
 
@@ -135,7 +159,7 @@ SUPERTONIC_SPEED=1.0
 .\.venv\Scripts\python.exe check_mic.py
 ```
 
-Проверить уровень сигнала и распознавание Vosk:
+Проверить микрофон и локальное распознавание:
 
 ```powershell
 .\.venv\Scripts\python.exe test_mic.py
@@ -159,9 +183,9 @@ SUPERTONIC_SPEED=1.0
 
 Проверьте, что локальный сервер включён и endpoint `http://127.0.0.1:1234/v1/models` открывается.
 
-**Vosk-модель не найдена**
+**Whisper не установлен или модель не загрузилась**
 
-Положите модель в `models/vosk-model-small-ru-0.22` или задайте `AI_ASSISTANT_VOSK_MODEL_PATH` в `.env`.
+Проверьте, что установлен `faster-whisper`, а `AI_ASSISTANT_WHISPER_MODEL` указывает на существующую локальную модель или допустимое имя модели.
 
 **Микрофон не распознаёт речь**
 
