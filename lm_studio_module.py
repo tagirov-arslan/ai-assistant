@@ -3,6 +3,7 @@
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 
@@ -64,6 +65,60 @@ class LMStudioModule:
             return "Модель ушла в режим рассуждения и не вернула финальный ответ. Попробуйте отправить запрос ещё раз."
         return "Модель вернула пустой ответ."
 
+    def ask_stream(self, history: list[dict[str, str]]) -> Iterator[str]:
+        """Стримит ответ модели по частям (SSE, stream=true).
+
+        Возвращает генератор фрагментов текста ответа. Фрагменты reasoning
+        пропускаются — отдаётся только финальный контент.
+        """
+        messages = [
+            {"role": "system", "content": self.config.system_prompt},
+            *history,
+        ]
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": True,
+        }
+
+        url = f"{self.config.api_base_url}/chat/completions"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.config.api_key or 'lm-studio'}",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        parsed = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = parsed.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        yield str(piece)
+        except urllib.error.HTTPError as error:
+            raw_error = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"LM Studio HTTP {error.code}: {raw_error or error.reason}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Не удалось подключиться к LM Studio: {error.reason}") from error
 
     def _request_json(self, method: str, endpoint: str, payload: dict[str, object] | None = None) -> dict[str, object]:
         url = f"{self.config.api_base_url}/{endpoint.lstrip('/')}"

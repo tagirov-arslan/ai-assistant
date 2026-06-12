@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
 import os
+import queue
+import re
 import tempfile
 import threading
 import wave
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +96,117 @@ class SpeechConfig:
     supertonic_speed: float = field(default_factory=lambda: float(os.getenv("SUPERTONIC_SPEED", "1.0") or "1.0"))
 
 
+class SentenceAssembler:
+    """Накапливает стримящийся текст и отдаёт законченные предложения для озвучки."""
+
+    _END_RE = re.compile(r"[.!?…]+[\"»')\]]*\s")
+
+    def __init__(self, min_length: int = 24) -> None:
+        self.min_length = min_length
+        self._buffer = ""
+
+    def feed(self, piece: str) -> list[str]:
+        """Добавляет фрагмент текста, возвращает готовые предложения (возможно пустой список)."""
+        self._buffer += piece
+        ready: list[str] = []
+        while True:
+            cut = self._find_cut()
+            if cut is None:
+                break
+            sentence = self._buffer[:cut].strip()
+            self._buffer = self._buffer[cut:]
+            if sentence:
+                ready.append(sentence)
+        return ready
+
+    def flush(self) -> str:
+        """Возвращает остаток буфера (хвост ответа без финальной пунктуации)."""
+        tail = self._buffer.strip()
+        self._buffer = ""
+        return tail
+
+    def _find_cut(self) -> int | None:
+        search_from = 0
+        while True:
+            newline = self._buffer.find("\n", search_from)
+            match = self._END_RE.search(self._buffer, search_from)
+
+            if newline == -1 and match is None:
+                return None
+
+            # Перенос строки — жёсткая граница (конец абзаца/пункта списка).
+            if newline != -1 and (match is None or newline < match.end()):
+                return newline + 1
+
+            end = match.end()
+            # Слишком короткие куски ("1.", "Да.") не отправляем отдельно —
+            # ждём продолжения и озвучиваем вместе со следующим предложением.
+            if len(self._buffer[:end].strip()) >= self.min_length:
+                return end
+            search_from = end
+
+
+class TtsStream:
+    """Конвейер озвучки: синтез следующего предложения идёт во время воспроизведения текущего."""
+
+    def __init__(self, module: "SpeechModule") -> None:
+        self._module = module
+        self._text_queue: queue.Queue[str | None] = queue.Queue()
+        self._wav_queue: queue.Queue[Path | None] = queue.Queue(maxsize=3)
+        self.cancelled = threading.Event()
+        self._closed = False
+        threading.Thread(target=self._synth_worker, daemon=True).start()
+        threading.Thread(target=self._play_worker, daemon=True).start()
+
+    def add(self, sentence: str) -> None:
+        if sentence and sentence.strip() and not self.cancelled.is_set():
+            self._text_queue.put(sentence.strip())
+
+    def close(self) -> None:
+        """Сообщает, что текста больше не будет; очередь доигрывает и завершается."""
+        if not self._closed:
+            self._closed = True
+            self._text_queue.put(None)
+
+    def cancel(self) -> None:
+        """Останавливает озвучку: текущее воспроизведение и всю очередь."""
+        self.cancelled.set()
+        self.close()
+
+    def _synth_worker(self) -> None:
+        while True:
+            text = self._text_queue.get()
+            if text is None:
+                self._wav_queue.put(None)
+                return
+            if self.cancelled.is_set():
+                continue
+            try:
+                with self._module.tts_lock:
+                    if self.cancelled.is_set():
+                        continue
+                    wav_path = self._module.synthesize_to_file(text)
+            except Exception:
+                continue
+            self._wav_queue.put(wav_path)
+
+    def _play_worker(self) -> None:
+        while True:
+            wav_path = self._wav_queue.get()
+            if wav_path is None:
+                return
+            try:
+                if not self.cancelled.is_set():
+                    self._module._play_wav_audio(wav_path, extra_stop=self.cancelled)
+            except Exception:
+                pass
+            finally:
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 class SpeechModule:
     """Offline speech-to-text and local text-to-speech through Supertonic 3."""
 
@@ -100,9 +214,11 @@ class SpeechModule:
         self.config = config or SpeechConfig()
         self.audio = pyaudio.PyAudio()
         self.tts_lock = threading.Lock()
+        self.whisper_lock = threading.Lock()
         self.stop_playback_event = threading.Event()
         self.supertonic_tts = None
         self.supertonic_voice_style = None
+        self._active_tts_stream: TtsStream | None = None
 
         self.tts_available = self._is_tts_available()
         self.stt_backend = self.config.stt_backend
@@ -167,6 +283,39 @@ class SpeechModule:
 
     def stop_speaking(self) -> None:
         self.stop_playback_event.set()
+        stream = self._active_tts_stream
+        if stream is not None:
+            stream.cancel()
+
+    def create_tts_stream(self) -> TtsStream:
+        """Создаёт конвейер озвучки по предложениям, останавливая предыдущий."""
+        previous = self._active_tts_stream
+        if previous is not None:
+            previous.cancel()
+        self.stop_playback_event.clear()
+        stream = TtsStream(self)
+        self._active_tts_stream = stream
+        return stream
+
+    def warm_up_async(self, on_done: Callable[[], None] | None = None) -> None:
+        """Загружает модели Whisper и Supertonic в фоне, чтобы первый запрос не ждал."""
+
+        def runner() -> None:
+            try:
+                if self.stt_available:
+                    self._ensure_whisper_model()
+            except Exception:
+                pass
+            try:
+                if self.tts_available:
+                    with self.tts_lock:
+                        self._ensure_supertonic_engine()
+            except Exception:
+                pass
+            if on_done is not None:
+                on_done()
+
+        threading.Thread(target=runner, daemon=True).start()
 
     def shutdown(self) -> None:
         self.stop_speaking()
@@ -243,12 +392,13 @@ class SpeechModule:
     def _ensure_whisper_model(self) -> None:
         if WhisperModel is None:
             raise RuntimeError("Пакет faster-whisper не установлен. Выполните: pip install faster-whisper")
-        if self.whisper_model is None:
-            self.whisper_model = WhisperModel(
-                self.config.whisper_model,
-                device=self.config.whisper_device,
-                compute_type=self.config.whisper_compute_type,
-            )
+        with self.whisper_lock:
+            if self.whisper_model is None:
+                self.whisper_model = WhisperModel(
+                    self.config.whisper_model,
+                    device=self.config.whisper_device,
+                    compute_type=self.config.whisper_compute_type,
+                )
 
     def _record_phrase(self) -> bytes:
         max_chunks = max(
@@ -328,7 +478,8 @@ class SpeechModule:
                 voice_name=self.config.supertonic_voice
             )
 
-    def _speak_supertonic(self, text: str) -> None:
+    def synthesize_to_file(self, text: str) -> Path:
+        """Синтезирует речь в временный WAV-файл и возвращает путь к нему."""
         self._ensure_supertonic_engine()
         wav, _duration = self.supertonic_tts.synthesize(
             text=text,
@@ -341,18 +492,20 @@ class SpeechModule:
             verbose=False,
         )
 
-        temp_path = None
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+        self.supertonic_tts.save_audio(wav, str(temp_path))
+        return temp_path
+
+    def _speak_supertonic(self, text: str) -> None:
+        temp_path = self.synthesize_to_file(text)
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_path = Path(temp_file.name)
-            self.supertonic_tts.save_audio(wav, str(temp_path))
             self._play_wav_audio(temp_path)
         finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @contextmanager
     def _open_input_stream(self, sample_rate: int, frames_per_buffer: int):
@@ -389,7 +542,7 @@ class SpeechModule:
             stream.stop_stream()
             stream.close()
 
-    def _play_wav_audio(self, wav_path: Path) -> None:
+    def _play_wav_audio(self, wav_path: Path, extra_stop: threading.Event | None = None) -> None:
         with wave.open(str(wav_path), "rb") as wav_file:
             stream = self.audio.open(
                 format=self.audio.get_format_from_width(wav_file.getsampwidth()),
@@ -400,6 +553,8 @@ class SpeechModule:
             )
             try:
                 while not self.stop_playback_event.is_set():
+                    if extra_stop is not None and extra_stop.is_set():
+                        break
                     chunk = wav_file.readframes(1024)
                     if not chunk:
                         break

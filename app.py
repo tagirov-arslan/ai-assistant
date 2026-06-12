@@ -8,13 +8,13 @@ from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 from lm_studio_module import LMStudioConfig, LMStudioModule
-from speech_module import SpeechConfig, SpeechModule
+from speech_module import SentenceAssembler, SpeechConfig, SpeechModule
 
 
 LM_CONFIG = LMStudioConfig(
     base_url="http://127.0.0.1:1234",
     api_key="lm-studio",
-    model="qwen/qwen3.6-35b-a3b",
+    model="google/gemma-4-e2b",
     temperature=0.7,
     max_tokens=2000,
     system_prompt="Ты полезный ИИ-ассистент. Отвечай кратко, понятно и на русском языке.",
@@ -58,6 +58,12 @@ class AssistantApp:
                 "system",
                 "Для Supertonic 3 установите пакет supertonic. Настройки голоса хранятся в assistant_settings.json.",
             )
+
+        # Прогрев моделей речи в фоне, чтобы первый голосовой запрос и первая озвучка не ждали загрузки.
+        self._set_status("Загружаю модели речи в фоне...")
+        self.speech_module.warm_up_async(
+            on_done=lambda: self.root.after(0, lambda: self._set_status("Готово к работе"))
+        )
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -559,14 +565,67 @@ class AssistantApp:
         self.chat_area.configure(state="disabled")
         self.chat_area.yview(tk.END)
 
-    def ask_llm(self, user_text: str) -> str:
+    def _begin_assistant_message(self) -> None:
+        timestamp = datetime.now().strftime("%H:%M")
+        self.chat_area.configure(state="normal")
+        self.chat_area.insert(tk.END, "Ассистент  ", "assistant_header")
+        self.chat_area.insert(tk.END, f"{timestamp}\n", "time")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.yview(tk.END)
+
+    def _append_assistant_text(self, piece: str) -> None:
+        self.chat_area.configure(state="normal")
+        self.chat_area.insert(tk.END, piece, "assistant_body")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.yview(tk.END)
+
+    def _end_assistant_message(self) -> None:
+        self._append_assistant_text("\n\n")
+        self._set_status("Готово к работе")
+
+    def _stream_llm_round(self, user_text: str) -> None:
+        """Стримит ответ LLM в чат и параллельно озвучивает готовые предложения.
+
+        Выполняется в рабочем потоке (не в потоке UI).
+        """
         self.conversation_history.append({"role": "user", "content": user_text})
+
+        tts_stream = self.speech_module.create_tts_stream() if self.speech_module.tts_available else None
+        assembler = SentenceAssembler()
+        chunks: list[str] = []
+        error_text: str | None = None
+
+        self.root.after(0, self._begin_assistant_message)
         try:
-            answer = self.llm_module.ask(self.conversation_history[1:])
-            self.conversation_history.append({"role": "assistant", "content": answer})
-            return answer
+            for piece in self.llm_module.ask_stream(self.conversation_history[1:]):
+                chunks.append(piece)
+                self.root.after(0, lambda p=piece: self._append_assistant_text(p))
+                if tts_stream is not None:
+                    for sentence in assembler.feed(piece):
+                        tts_stream.add(sentence)
         except Exception as error:
-            return f"Ошибка обращения к модели: {error}"
+            error_text = f"Ошибка обращения к модели: {error}"
+
+        answer = "".join(chunks).strip()
+
+        if tts_stream is not None:
+            if error_text is None and answer:
+                tail = assembler.flush()
+                if tail:
+                    tts_stream.add(tail)
+                tts_stream.close()
+            else:
+                tts_stream.cancel()
+
+        if error_text is not None:
+            prefix = "\n" if answer else ""
+            self.root.after(0, lambda: self._append_assistant_text(f"{prefix}{error_text}"))
+        elif not answer:
+            self.root.after(0, lambda: self._append_assistant_text("Модель вернула пустой ответ."))
+        else:
+            self.conversation_history.append({"role": "assistant", "content": answer})
+
+        self.root.after(0, self._end_assistant_message)
 
     def handle_send(self) -> None:
         user_text = self._get_input_text()
@@ -575,21 +634,9 @@ class AssistantApp:
 
         self._clear_input()
         self.add_message("user", user_text)
-        self._set_status("Ассистент обрабатывает запрос...")
+        self._set_status("Ассистент отвечает...")
 
-        def worker() -> None:
-            answer = self.ask_llm(user_text)
-
-            def update_ui() -> None:
-                self.add_message("assistant", answer)
-                self._set_status("Готово к работе")
-
-            self.root.after(0, update_ui)
-
-            if not answer.startswith("Ошибка") and self.speech_module.tts_available:
-                self.speech_module.text_to_speech_async(answer)
-
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._stream_llm_round, args=(user_text,), daemon=True).start()
 
     def handle_voice_input(self) -> None:
         self._set_status("Слушаю ваш голос...")
@@ -601,21 +648,8 @@ class AssistantApp:
                 def process_voice() -> None:
                     self._clear_input()
                     self.add_message("user", text)
-                    self._set_status("Обрабатываю голосовой запрос...")
-
-                    def ask_worker() -> None:
-                        answer = self.ask_llm(text)
-
-                        def update_answer() -> None:
-                            self.add_message("assistant", answer)
-                            self._set_status("Готово к работе")
-
-                        self.root.after(0, update_answer)
-
-                        if not answer.startswith("Ошибка") and self.speech_module.tts_available:
-                            self.speech_module.text_to_speech_async(answer)
-
-                    threading.Thread(target=ask_worker, daemon=True).start()
+                    self._set_status("Ассистент отвечает...")
+                    threading.Thread(target=self._stream_llm_round, args=(text,), daemon=True).start()
 
                 self.root.after(0, process_voice)
 
@@ -627,6 +661,7 @@ class AssistantApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def clear_chat(self) -> None:
+        self.speech_module.stop_speaking()
         self.conversation_history = [{"role": "system", "content": LM_CONFIG.system_prompt}]
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)
