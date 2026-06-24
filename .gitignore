@@ -14,3 +14,12 @@ whisper-large-v3-turbo-ct2/
 
 .idea/
 *.lnk
+
+# Отладочные артефакты и временные бэкапы редактора
+metahuman_audio_debug.log
+*.log
+*.codex-backup-*
+
+# Папки экспорта/переноса
+export/
+*-export-*.zip

@@ -1,0 +1,31 @@
+{
+  "input_device_index": null,
+  "output_device_index": null,
+  "supertonic_voice": "M1",
+  "supertonic_lang": "ru",
+  "supertonic_steps": 8,
+  "supertonic_speed": 1.0,
+  "metahuman_enabled": false,
+  "osc_host": "127.0.0.1",
+  "osc_port": 9000,
+  "wake_word_enabled": true,
+  "wake_words": [
+    "Сталин",
+    "Эй, Сталин",
+    "Слушай Сталин"
+  ],
+  "wake_word_language": "ru",
+  "wake_word_listen_interval": 3.0,
+  "wake_word_timeout": 5.0,
+  "wake_word_reply_enabled": true,
+  "wake_word_reply_text": "Слушаю",
+  "interrupt_enabled": true,
+  "interrupt_words": [
+    "стоп",
+    "остановись",
+    "хватит"
+  ],
+  "interrupt_by_wake_word": true,
+  "interrupt_listen_during_tts": true,
+  "command_listen_timeout": 8.0
+}

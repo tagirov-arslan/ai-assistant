@@ -52,7 +52,64 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+Требуется **Python 3.12** (не 3.13 — в нём удалён модуль `audioop`, который нужен для обработки звука).
+
 Если `PyAudio` не устанавливается через `pip`, установите подходящее колесо для вашей версии Python или используйте окружение, где PortAudio уже доступен.
+
+## Перенос на другой компьютер
+
+В репозитории есть инструменты для быстрого переноса и развёртывания.
+
+### Экспорт (на исходной машине)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File export_assistant.ps1
+```
+
+Соберёт `export/ai-assistant-export-<дата>.zip` с исходниками, моделями
+(Whisper + Supertonic), скриптами установки и шаблоном настроек. Исключает
+виртуальные окружения, кеши, git, отладочные логи и личный
+`assistant_settings.json`. Флаг `-NoModels` соберёт архив без папок моделей
+(~1.2 ГБ) — тогда модели нужно скопировать отдельно.
+
+### Развёртывание (на новой машине)
+
+1. Распакуйте архив (или склонируйте репозиторий).
+2. Установите **Python 3.12** (https://www.python.org/downloads/).
+3. Запустите `setup.bat`. Он:
+   - создаёт виртуальное окружение и ставит зависимости;
+   - **скачивает модели Whisper и Supertonic** автоматически (`download_models.py`,
+     ~1.2 ГБ, нужен интернет) — копировать их вручную больше не требуется;
+   - создаёт `assistant_settings.json` из шаблона;
+   - проверяет готовность окружения (`check_setup.py`).
+4. Установите и запустите **LM Studio**, загрузите модель, включите локальный
+   сервер. Имя модели должно совпадать с `model` в `LM_CONFIG` внутри `app.py`.
+5. Запустите `run_app.bat`.
+
+Скачать модели отдельно (если нужно перекачать или сделать это вручную):
+
+```powershell
+.venv-win\Scripts\python.exe download_models.py          # скачать недостающее
+.venv-win\Scripts\python.exe download_models.py --force  # перекачать заново
+```
+
+Проверить окружение в любой момент:
+
+```powershell
+.venv-win\Scripts\python.exe check_setup.py
+```
+
+Модели (`whisper-large-v3-turbo-ct2/` ~780 МБ, `supertonic-3-model/` ~383 МБ) не
+хранятся в git. Есть два пути их получить:
+- **онлайн** — `setup.bat`/`download_models.py` скачают их с HuggingFace;
+- **офлайн** — соберите полный архив `export_assistant.ps1` (без флага
+  `-NoModels`), он включит модели внутрь.
+
+> Индексы аудиоустройств в `assistant_settings.json` зависят от конкретного ПК.
+> На новой машине шаблон `assistant_settings.example.json` ставит их в `null`,
+> и микрофон выбирается автоматически. Если переносили свой
+> `assistant_settings.json` — удалите его или сбросьте `input_device_index` и
+> `output_device_index` в `null`.
 
 ## Локальные модели
 
