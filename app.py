@@ -10,10 +10,12 @@ from tkinter import messagebox, scrolledtext, ttk
 from lm_studio_module import LMStudioConfig, LMStudioModule
 from metahuman_bridge import MetaHumanBridge
 from speech_module import SentenceAssembler, SpeechConfig, SpeechModule
+from interrupt_listener import InterruptListener
 from wake_word_listener import WakeWordListener
 
 
-DEFAULT_WAKE_WORDS = ["ассистент", "эй ассистент", "слушай ассистент"]
+DEFAULT_WAKE_WORDS = ["Сталин", "Эй, Сталин", "Слушай Сталин"]
+DEFAULT_INTERRUPT_WORDS = ["стоп", "остановись", "хватит"]
 
 
 LM_CONFIG = LMStudioConfig(
@@ -65,6 +67,18 @@ class AssistantApp:
         # Wake word: фоновый слушатель ключевой фразы поверх существующих STT/TTS/LLM.
         self._manual_capture_active = False
         self.wake_word_timeout = float(self.settings.get("wake_word_timeout", 5.0))
+        self.command_listen_timeout = float(self.settings.get("command_listen_timeout", 8.0))
+        self.wake_reply_enabled = bool(self.settings.get("wake_word_reply_enabled", True))
+        self.wake_reply_text = str(self.settings.get("wake_word_reply_text", "Слушаю")) or "Слушаю"
+        self.interrupt_enabled = bool(self.settings.get("interrupt_enabled", True))
+        self.interrupt_by_wake_word = bool(self.settings.get("interrupt_by_wake_word", True))
+        self.interrupt_listen_during_tts = bool(self.settings.get("interrupt_listen_during_tts", True))
+
+        # Состояние текущего ответа для прерывания (создаётся на каждый ответ).
+        self._answer_interrupt: str | None = None
+        self._answer_cancel = threading.Event()
+        self._answer_done = threading.Event()
+
         self.wake_status_text = (
             "Ожидание wake word" if bool(self.settings.get("wake_word_enabled", True)) else "Выключен"
         )
@@ -77,6 +91,17 @@ class AssistantApp:
             listen_interval=float(self.settings.get("wake_word_listen_interval", 3.0)),
             language=str(self.settings.get("wake_word_language", "ru")),
             enabled=bool(self.settings.get("wake_word_enabled", True)),
+        )
+        self.interrupt_listener = InterruptListener(
+            interrupt_words=list(self.settings.get("interrupt_words", DEFAULT_INTERRUPT_WORDS)),
+            wake_words=(
+                list(self.settings.get("wake_words", DEFAULT_WAKE_WORDS))
+                if self.interrupt_by_wake_word
+                else []
+            ),
+            stt_service=self._recognize_interrupt_phrase,
+            on_stop_detected=self._handle_interrupt_stop,
+            on_wake_detected=self._handle_interrupt_wake,
         )
 
         self.conversation_history = [{"role": "system", "content": LM_CONFIG.system_prompt}]
@@ -223,6 +248,13 @@ class AssistantApp:
             "wake_word_language": "ru",
             "wake_word_listen_interval": 3.0,
             "wake_word_timeout": 5.0,
+            "wake_word_reply_enabled": True,
+            "wake_word_reply_text": "Слушаю",
+            "interrupt_enabled": True,
+            "interrupt_words": list(DEFAULT_INTERRUPT_WORDS),
+            "interrupt_by_wake_word": True,
+            "interrupt_listen_during_tts": True,
+            "command_listen_timeout": 8.0,
         }
 
     def _load_settings(self) -> dict[str, object]:
@@ -268,6 +300,22 @@ class AssistantApp:
             settings["wake_word_listen_interval"] = float(raw["wake_word_listen_interval"])
         if isinstance(raw.get("wake_word_timeout"), (int, float)) and raw["wake_word_timeout"] > 0:
             settings["wake_word_timeout"] = float(raw["wake_word_timeout"])
+        if isinstance(raw.get("wake_word_reply_enabled"), bool):
+            settings["wake_word_reply_enabled"] = raw["wake_word_reply_enabled"]
+        if isinstance(raw.get("wake_word_reply_text"), str) and raw["wake_word_reply_text"].strip():
+            settings["wake_word_reply_text"] = raw["wake_word_reply_text"].strip()
+        if isinstance(raw.get("interrupt_enabled"), bool):
+            settings["interrupt_enabled"] = raw["interrupt_enabled"]
+        if isinstance(raw.get("interrupt_words"), list):
+            stop_words = [w.strip() for w in raw["interrupt_words"] if isinstance(w, str) and w.strip()]
+            if stop_words:
+                settings["interrupt_words"] = stop_words
+        if isinstance(raw.get("interrupt_by_wake_word"), bool):
+            settings["interrupt_by_wake_word"] = raw["interrupt_by_wake_word"]
+        if isinstance(raw.get("interrupt_listen_during_tts"), bool):
+            settings["interrupt_listen_during_tts"] = raw["interrupt_listen_during_tts"]
+        if isinstance(raw.get("command_listen_timeout"), (int, float)) and raw["command_listen_timeout"] > 0:
+            settings["command_listen_timeout"] = float(raw["command_listen_timeout"])
         return settings
 
     def _save_settings(self) -> None:
@@ -553,7 +601,7 @@ class AssistantApp:
     def _wake_label_text(self) -> str:
         if not self.wake_listener.enabled:
             return "Выключен"
-        words = ", ".join(self.wake_listener.wake_words[:3]) or "—"
+        words = " · ".join(self.wake_listener.wake_words[:3]) or "—"
         return f"{self.wake_status_text}\nФразы: {words}"
 
     def _refresh_wake_label(self) -> None:
@@ -598,8 +646,103 @@ class AssistantApp:
         self._refresh_wake_label()
         self.add_message("system", "Wake word включён." if enabled else "Wake word выключен.")
 
+    def _recognize_interrupt_phrase(self) -> str:
+        """Короткое окно прослушивания для детектора прерывания (снаппи)."""
+        return self.speech_module.recognize_short_phrase(
+            start_timeout=1.2,
+            phrase_limit=2.2,
+            silence_limit=0.3,
+        )
+
+    def _handle_interrupt_stop(self) -> None:
+        """Колбэк прерывания по стоп-слову (из потока interrupt-слушателя)."""
+        print("[Interrupt] Assistant speech interrupted", flush=True)
+        self._answer_interrupt = "stop"
+        self._answer_cancel.set()
+        try:
+            self.speech_module.stop_speaking()
+        except Exception as error:
+            print(f"[Interrupt] Failed to stop TTS: {error}", flush=True)
+        self._answer_done.set()
+
+    def _handle_interrupt_wake(self) -> None:
+        """Колбэк прерывания по повторному wake word (из потока interrupt-слушателя)."""
+        print("[Interrupt] Assistant speech interrupted", flush=True)
+        self._answer_interrupt = "wake"
+        self._answer_cancel.set()
+        try:
+            self.speech_module.stop_speaking()
+        except Exception as error:
+            print(f"[Interrupt] Failed to stop TTS: {error}", flush=True)
+        self._answer_done.set()
+
+    def _speak_wake_reply(self) -> None:
+        """Короткий ответ-подтверждение ('Слушаю') через текущий TTS (блокирующе)."""
+        if not self.wake_reply_enabled:
+            return
+        reply = self.wake_reply_text
+        self._set_wake_status("Слушаю")
+        self.root.after(0, lambda: self._set_status("Слушаю"))
+        print(f"[WakeWord] Reply: {reply}", flush=True)
+        self._add_message_async("assistant", reply)
+        if not self.speech_module.tts_available:
+            return
+        try:
+            self.speech_module.text_to_speech(reply)
+        except Exception as error:
+            self._set_wake_status("Ошибка TTS")
+            print(f"[WakeWord] Reply TTS error: {error}", flush=True)
+
+    def _answer_with_interrupt(self, text: str) -> str:
+        """Генерирует и озвучивает ответ, слушая прерывание. Возвращает 'wake'|'stop'|'done'."""
+        self._answer_interrupt = None
+        self._answer_cancel = threading.Event()
+        self._answer_done = threading.Event()
+        cancel_event = self._answer_cancel
+        done_event = self._answer_done
+
+        def worker() -> None:
+            try:
+                self._stream_llm_round(text, cancel_event=cancel_event)
+                self.speech_module.wait_until_speech_done(timeout=300)
+            finally:
+                done_event.set()
+
+        self.root.after(0, lambda: self._set_status("Озвучиваю ответ..."))
+        self._set_wake_status("Озвучиваю ответ")
+
+        watch = (
+            self.interrupt_enabled
+            and self.interrupt_listen_during_tts
+            and self.speech_module.stt_available
+            and self.interrupt_listener is not None
+        )
+        if watch:
+            self.interrupt_listener.start_during_tts()
+
+        threading.Thread(target=worker, args=(), daemon=True).start()
+        done_event.wait(timeout=600)
+
+        if self.interrupt_listener is not None:
+            self.interrupt_listener.stop()
+
+        outcome = self._answer_interrupt or "done"
+        if outcome == "stop":
+            self._set_wake_status("Ответ прерван")
+            self._add_message_async("system", "Ответ прерван.")
+            print("[Interrupt] Returning to idle mode", flush=True)
+        elif outcome == "wake":
+            self._set_wake_status("Ответ прерван")
+            print("[Interrupt] Switching to new command mode", flush=True)
+        return outcome
+
     def _on_wake_detected(self) -> None:
-        """Полный голосовой цикл после ключевой фразы. Выполняется в потоке слушателя."""
+        """Полный голосовой цикл после ключевой фразы. Выполняется в потоке слушателя.
+
+        Сценарий: ответить 'Слушаю' → принять команду → ответить с возможностью
+        прерывания. Повторный wake word во время ответа запускает новый цикл,
+        стоп-слово — возврат в ожидание.
+        """
         if self._manual_capture_active:
             return
         self._manual_capture_active = True
@@ -608,30 +751,44 @@ class AssistantApp:
             self.speech_module.stop_speaking()
             self.metahuman_bridge.speak_end()
 
-            self.root.after(0, lambda: self._set_status("Слушаю команду..."))
-            self._set_wake_status("Слушаю команду")
-            self._set_metahuman_state("listening")
+            need_command = True
+            while need_command:
+                need_command = False
 
-            try:
-                self._set_wake_status("Распознаю речь")
-                text = self.speech_module.speech_to_text(start_timeout=self.wake_word_timeout)
-            except Exception as error:
-                self._set_metahuman_state("idle")
-                self.root.after(0, lambda: self._set_status("Готово к работе"))
-                self._add_message_async("system", f"Команда не распознана: {error}")
-                return
+                # 1. Короткий ответ-подтверждение "Слушаю".
+                self._speak_wake_reply()
+                print("[WakeWord] Waiting for command...", flush=True)
 
-            self._add_message_async("user", text)
-            self.root.after(0, lambda: self._set_status("Ассистент отвечает..."))
-            self._set_wake_status("Генерирую ответ")
-            self._stream_llm_round(text)
+                # 2. Приём команды через полноценный STT.
+                self.root.after(0, lambda: self._set_status("Слушаю команду..."))
+                self._set_wake_status("Слушаю команду")
+                self._set_metahuman_state("listening")
+                try:
+                    self._set_wake_status("Распознаю речь")
+                    text = self.speech_module.speech_to_text(start_timeout=self.command_listen_timeout)
+                except Exception as error:
+                    self._set_metahuman_state("idle")
+                    self.root.after(0, lambda: self._set_status("Готово к работе"))
+                    self._add_message_async("system", f"Команда не распознана: {error}")
+                    self._set_wake_status("Ошибка STT")
+                    break
 
-            # Дать озвучке доиграть до конца, иначе слушатель запишет собственный голос.
-            self._set_wake_status("Озвучиваю ответ")
-            self.speech_module.wait_until_speech_done(timeout=120)
+                print(f"[WakeWord] Command recognized: {text}", flush=True)
+                self._add_message_async("user", text)
+                self.root.after(0, lambda: self._set_status("Ассистент отвечает..."))
+                self._set_wake_status("Генерирую ответ")
+
+                # 3. Ответ с прослушиванием прерывания.
+                outcome = self._answer_with_interrupt(text)
+                if outcome == "wake":
+                    # Повторный wake word во время ответа → новый цикл команды.
+                    need_command = True
         finally:
             self._manual_capture_active = False
-            self._set_wake_status("Ожидание wake word")
+            self._set_metahuman_state("idle")
+            self.root.after(0, lambda: self._set_status("Готово к работе"))
+            # Статус "Ожидание wake word" выставит цикл слушателя на следующей итерации.
+            self._set_wake_status("Возврат в режим ожидания")
 
     def open_output_device_dialog(self) -> None:
         devices = self.speech_module.list_output_devices()
@@ -894,10 +1051,12 @@ class AssistantApp:
         self._append_assistant_text("\n\n")
         self._set_status("Готово к работе")
 
-    def _stream_llm_round(self, user_text: str) -> None:
+    def _stream_llm_round(self, user_text: str, cancel_event: threading.Event | None = None) -> None:
         """Стримит ответ LLM в чат и параллельно озвучивает готовые предложения.
 
-        Выполняется в рабочем потоке (не в потоке UI).
+        Выполняется в рабочем потоке (не в потоке UI). Если передан cancel_event и
+        он выставлен (прерывание пользователем) — генерация и озвучка прекращаются,
+        ответ не дописывается и не попадает в историю.
         """
         self.conversation_history.append({"role": "user", "content": user_text})
         self._set_metahuman_state("thinking")
@@ -906,10 +1065,14 @@ class AssistantApp:
         assembler = SentenceAssembler()
         chunks: list[str] = []
         error_text: str | None = None
+        cancelled = False
 
         self.root.after(0, self._begin_assistant_message)
         try:
             for piece in self.llm_module.ask_stream(self.conversation_history[1:]):
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 chunks.append(piece)
                 self.root.after(0, lambda p=piece: self._append_assistant_text(p))
                 if tts_stream is not None:
@@ -921,13 +1084,19 @@ class AssistantApp:
         answer = "".join(chunks).strip()
 
         if tts_stream is not None:
-            if error_text is None and answer:
+            if not cancelled and error_text is None and answer:
                 tail = assembler.flush()
                 if tail:
                     tts_stream.add(tail)
                 tts_stream.close()
             else:
                 tts_stream.cancel()
+
+        if cancelled:
+            # Прерывание: ответ не пишем в историю и не показываем как ошибку.
+            self._set_metahuman_state("idle")
+            self.root.after(0, self._end_assistant_message)
+            return
 
         if error_text is not None:
             prefix = "\n" if answer else ""
@@ -997,6 +1166,8 @@ class AssistantApp:
 
     def on_close(self) -> None:
         self.wake_listener.stop()
+        if self.interrupt_listener is not None:
+            self.interrupt_listener.stop()
         self.speech_module.shutdown()
         self.metahuman_bridge.shutdown()
         self.root.destroy()

@@ -17,11 +17,23 @@ import threading
 from collections.abc import Callable
 
 
-def _normalize(text: str) -> str:
-    """Приводит текст к нижнему регистру и убирает пунктуацию для сравнения."""
+def normalize_text(text: str) -> str:
+    """Нормализует текст для сравнения ключевых фраз.
+
+    - нижний регистр;
+    - "ё" → "е";
+    - убирает запятые/точки/!/? и прочую пунктуацию;
+    - схлопывает лишние пробелы.
+
+    "Эй, Сталин!" → "эй сталин"; "Слушай, Сталин" → "слушай сталин".
+    """
     text = text.lower().replace("ё", "е")
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return " ".join(text.split())
+
+
+# Обратная совместимость / краткий внутренний алиас.
+_normalize = normalize_text
 
 
 class WakeWordListener:
@@ -136,7 +148,7 @@ class WakeWordListener:
             self._log(f"Recognized text: {text}")
 
             if self.contains_wake_word(text):
-                self._log("Wake word detected")
+                self._log(f"Wake word detected: {text.strip()}")
                 self._set_status("Wake word обнаружено")
                 self._log("Waiting for user command")
                 try:
