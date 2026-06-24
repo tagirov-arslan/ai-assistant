@@ -8,7 +8,12 @@ from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 from lm_studio_module import LMStudioConfig, LMStudioModule
+from metahuman_bridge import MetaHumanBridge
 from speech_module import SentenceAssembler, SpeechConfig, SpeechModule
+from wake_word_listener import WakeWordListener
+
+
+DEFAULT_WAKE_WORDS = ["ассистент", "эй ассистент", "слушай ассистент"]
 
 
 LM_CONFIG = LMStudioConfig(
@@ -41,10 +46,45 @@ class AssistantApp:
             self.settings["input_device_index"] = active_input_index
             self._save_settings()
 
+        self.metahuman_bridge = MetaHumanBridge(
+            host=str(self.settings.get("osc_host", "127.0.0.1")),
+            port=int(self.settings.get("osc_port", 9000)),
+            enabled=bool(self.settings.get("metahuman_enabled", False)),
+        )
+        # Колбэки приходят из потоков озвучки — UI обновляем через root.after.
+        self.speech_module.on_speak_start = lambda: (
+            self.metahuman_bridge.speak_start(),
+            self.root.after(0, self._refresh_metahuman_label),
+        )
+        self.speech_module.on_speak_end = lambda: (
+            self.metahuman_bridge.speak_end(),
+            self.root.after(0, self._refresh_metahuman_label),
+        )
+        self.speech_module.on_audio_chunk = self.metahuman_bridge.send_audio_chunk
+
+        # Wake word: фоновый слушатель ключевой фразы поверх существующих STT/TTS/LLM.
+        self._manual_capture_active = False
+        self.wake_word_timeout = float(self.settings.get("wake_word_timeout", 5.0))
+        self.wake_status_text = (
+            "Ожидание wake word" if bool(self.settings.get("wake_word_enabled", True)) else "Выключен"
+        )
+        self.wake_listener = WakeWordListener(
+            wake_words=list(self.settings.get("wake_words", DEFAULT_WAKE_WORDS)),
+            stt_service=self.speech_module.recognize_short_phrase,
+            on_wake_detected=self._on_wake_detected,
+            on_status=self._set_wake_status,
+            should_listen=self._wake_should_listen,
+            listen_interval=float(self.settings.get("wake_word_listen_interval", 3.0)),
+            language=str(self.settings.get("wake_word_language", "ru")),
+            enabled=bool(self.settings.get("wake_word_enabled", True)),
+        )
+
         self.conversation_history = [{"role": "system", "content": LM_CONFIG.system_prompt}]
         self.status_var = tk.StringVar(value="Готово к работе")
         self.mic_var = tk.StringVar(value=self.speech_module.get_input_device_label())
         self.voice_var = tk.StringVar(value=self.speech_module.get_tts_status_label())
+        self.metahuman_var = tk.StringVar(value=self._metahuman_label_text())
+        self.wake_var = tk.StringVar(value=self._wake_label_text())
 
         self._build_ui()
         self.root.update_idletasks()
@@ -62,8 +102,12 @@ class AssistantApp:
         # Прогрев моделей речи в фоне, чтобы первый голосовой запрос и первая озвучка не ждали загрузки.
         self._set_status("Загружаю модели речи в фоне...")
         self.speech_module.warm_up_async(
-            on_done=lambda: self.root.after(0, lambda: self._set_status("Готово к работе"))
+            on_done=lambda: self.root.after(0, self._on_models_ready)
         )
+
+    def _on_models_ready(self) -> None:
+        self._set_status("Готово к работе")
+        self._start_wake_word_if_enabled()
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -166,10 +210,19 @@ class AssistantApp:
     def _default_settings(self) -> dict[str, object]:
         return {
             "input_device_index": None,
+            "output_device_index": None,
             "supertonic_voice": "F1",
             "supertonic_lang": "ru",
             "supertonic_steps": 8,
             "supertonic_speed": 1.0,
+            "metahuman_enabled": False,
+            "osc_host": "127.0.0.1",
+            "osc_port": 9000,
+            "wake_word_enabled": True,
+            "wake_words": list(DEFAULT_WAKE_WORDS),
+            "wake_word_language": "ru",
+            "wake_word_listen_interval": 3.0,
+            "wake_word_timeout": 5.0,
         }
 
     def _load_settings(self) -> dict[str, object]:
@@ -184,6 +237,14 @@ class AssistantApp:
 
         if isinstance(raw.get("input_device_index"), int):
             settings["input_device_index"] = raw["input_device_index"]
+        if isinstance(raw.get("output_device_index"), int):
+            settings["output_device_index"] = raw["output_device_index"]
+        if isinstance(raw.get("metahuman_enabled"), bool):
+            settings["metahuman_enabled"] = raw["metahuman_enabled"]
+        if isinstance(raw.get("osc_host"), str) and raw["osc_host"].strip():
+            settings["osc_host"] = raw["osc_host"].strip()
+        if isinstance(raw.get("osc_port"), int):
+            settings["osc_port"] = raw["osc_port"]
         for key in [
             "supertonic_voice",
             "supertonic_lang",
@@ -195,6 +256,18 @@ class AssistantApp:
             settings["supertonic_steps"] = raw["supertonic_steps"]
         if isinstance(raw.get("supertonic_speed"), (int, float)):
             settings["supertonic_speed"] = float(raw["supertonic_speed"])
+        if isinstance(raw.get("wake_word_enabled"), bool):
+            settings["wake_word_enabled"] = raw["wake_word_enabled"]
+        if isinstance(raw.get("wake_words"), list):
+            words = [w.strip() for w in raw["wake_words"] if isinstance(w, str) and w.strip()]
+            if words:
+                settings["wake_words"] = words
+        if isinstance(raw.get("wake_word_language"), str) and raw["wake_word_language"].strip():
+            settings["wake_word_language"] = raw["wake_word_language"].strip()
+        if isinstance(raw.get("wake_word_listen_interval"), (int, float)) and raw["wake_word_listen_interval"] > 0:
+            settings["wake_word_listen_interval"] = float(raw["wake_word_listen_interval"])
+        if isinstance(raw.get("wake_word_timeout"), (int, float)) and raw["wake_word_timeout"] > 0:
+            settings["wake_word_timeout"] = float(raw["wake_word_timeout"])
         return settings
 
     def _save_settings(self) -> None:
@@ -205,6 +278,11 @@ class AssistantApp:
             input_device_index=(
                 self.settings.get("input_device_index")
                 if isinstance(self.settings.get("input_device_index"), int)
+                else None
+            ),
+            output_device_index=(
+                self.settings.get("output_device_index")
+                if isinstance(self.settings.get("output_device_index"), int)
                 else None
             ),
             supertonic_voice=str(self.settings.get("supertonic_voice", "F1")) or "F1",
@@ -257,9 +335,47 @@ class AssistantApp:
             pady=(8, 0),
         )
 
+        metahuman_card = ttk.Frame(sidebar, style="SidebarCard.TFrame", padding=14)
+        metahuman_card.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(metahuman_card, text="MetaHuman", style="SidebarCardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            metahuman_card,
+            textvariable=self.metahuman_var,
+            style="SidebarInfo.TLabel",
+            wraplength=220,
+        ).pack(anchor="w", pady=(8, 0))
+
+        wake_card = ttk.Frame(sidebar, style="SidebarCard.TFrame", padding=14)
+        wake_card.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(wake_card, text="Wake word", style="SidebarCardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            wake_card,
+            textvariable=self.wake_var,
+            style="SidebarInfo.TLabel",
+            wraplength=220,
+        ).pack(anchor="w", pady=(8, 0))
+
+        ttk.Button(
+            sidebar,
+            text="Wake word вкл/выкл",
+            style="Ghost.TButton",
+            command=self.toggle_wake_word,
+        ).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            sidebar,
+            text="MetaHuman вкл/выкл",
+            style="Ghost.TButton",
+            command=self.toggle_metahuman,
+        ).pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(
+            sidebar,
+            text="Устройство вывода озвучки",
+            style="Ghost.TButton",
+            command=self.open_output_device_dialog,
+        ).pack(fill=tk.X, pady=(10, 0))
         ttk.Button(sidebar, text="Выбрать голос", style="Ghost.TButton", command=self.open_voice_dialog).pack(
             fill=tk.X,
-            pady=(6, 0),
+            pady=(10, 0),
         )
         ttk.Button(sidebar, text="Выбрать микрофон", style="Ghost.TButton", command=self.open_microphone_dialog).pack(
             fill=tk.X,
@@ -393,6 +509,201 @@ class AssistantApp:
     def _refresh_device_labels(self) -> None:
         self.mic_var.set(self.speech_module.get_input_device_label())
         self.voice_var.set(self.speech_module.get_tts_status_label())
+        self._refresh_metahuman_label()
+
+    def _metahuman_label_text(self) -> str:
+        if not self.metahuman_bridge.enabled:
+            return "Выключен"
+        state_names = {
+            "idle": "ожидание",
+            "listening": "слушает",
+            "thinking": "думает",
+            "speaking": "говорит",
+        }
+        state = state_names.get(self.metahuman_bridge.get_state(), "ожидание")
+        return (
+            f"OSC {self.metahuman_bridge.host}:{self.metahuman_bridge.port} | {state}\n"
+            f"Вывод TTS: {self.speech_module.get_output_device_label()}"
+        )
+
+    def _refresh_metahuman_label(self) -> None:
+        self.metahuman_var.set(self._metahuman_label_text())
+
+    def _set_metahuman_state(self, state: str) -> None:
+        """Шлёт состояние в UE и обновляет подпись. Безопасно из любого потока."""
+        self.metahuman_bridge.set_state(state)
+        self.root.after(0, self._refresh_metahuman_label)
+
+    def toggle_metahuman(self) -> None:
+        enabled = not self.metahuman_bridge.enabled
+        self.metahuman_bridge.set_enabled(enabled)
+        self.settings["metahuman_enabled"] = enabled
+        self._save_settings()
+        self._refresh_metahuman_label()
+        self.add_message(
+            "system",
+            "MetaHuman-мост включён: OSC-команды идут на "
+            f"{self.metahuman_bridge.host}:{self.metahuman_bridge.port}."
+            if enabled
+            else "MetaHuman-мост выключен.",
+        )
+
+    # --- Wake word -----------------------------------------------------
+
+    def _wake_label_text(self) -> str:
+        if not self.wake_listener.enabled:
+            return "Выключен"
+        words = ", ".join(self.wake_listener.wake_words[:3]) or "—"
+        return f"{self.wake_status_text}\nФразы: {words}"
+
+    def _refresh_wake_label(self) -> None:
+        self.wake_var.set(self._wake_label_text())
+
+    def _set_wake_status(self, status: str) -> None:
+        """Обновляет статус wake word. Безопасно из любого потока."""
+        self.wake_status_text = status
+        self.root.after(0, self._refresh_wake_label)
+
+    def _add_message_async(self, role: str, text: str) -> None:
+        self.root.after(0, lambda: self.add_message(role, text))
+
+    def _wake_should_listen(self) -> bool:
+        """Слушатель не должен писать с микрофона, пока ассистент занят."""
+        return not self._manual_capture_active and not self.speech_module.is_busy()
+
+    def _start_wake_word_if_enabled(self) -> None:
+        if not self.wake_listener.enabled:
+            self._set_wake_status("Выключен")
+            return
+        if not self.speech_module.stt_available:
+            self.wake_listener.enabled = False
+            self._set_wake_status("STT недоступен")
+            self.add_message("system", "Wake word отключён: STT-движок недоступен.")
+            return
+        self.wake_listener.start()
+        self._set_wake_status("Ожидание wake word")
+        self.add_message(
+            "system",
+            f"Wake word активен. Скажите «{self.wake_listener.wake_words[0]}», чтобы дать команду голосом.",
+        )
+
+    def toggle_wake_word(self) -> None:
+        enabled = not self.wake_listener.enabled
+        if enabled and not self.speech_module.stt_available:
+            messagebox.showerror("Ошибка", "STT-движок недоступен — wake word работать не будет.")
+            return
+        self.wake_listener.set_enabled(enabled)
+        self.settings["wake_word_enabled"] = enabled
+        self._save_settings()
+        self._refresh_wake_label()
+        self.add_message("system", "Wake word включён." if enabled else "Wake word выключен.")
+
+    def _on_wake_detected(self) -> None:
+        """Полный голосовой цикл после ключевой фразы. Выполняется в потоке слушателя."""
+        if self._manual_capture_active:
+            return
+        self._manual_capture_active = True
+        try:
+            # На всякий случай прерываем текущую озвучку перед записью команды.
+            self.speech_module.stop_speaking()
+            self.metahuman_bridge.speak_end()
+
+            self.root.after(0, lambda: self._set_status("Слушаю команду..."))
+            self._set_wake_status("Слушаю команду")
+            self._set_metahuman_state("listening")
+
+            try:
+                self._set_wake_status("Распознаю речь")
+                text = self.speech_module.speech_to_text(start_timeout=self.wake_word_timeout)
+            except Exception as error:
+                self._set_metahuman_state("idle")
+                self.root.after(0, lambda: self._set_status("Готово к работе"))
+                self._add_message_async("system", f"Команда не распознана: {error}")
+                return
+
+            self._add_message_async("user", text)
+            self.root.after(0, lambda: self._set_status("Ассистент отвечает..."))
+            self._set_wake_status("Генерирую ответ")
+            self._stream_llm_round(text)
+
+            # Дать озвучке доиграть до конца, иначе слушатель запишет собственный голос.
+            self._set_wake_status("Озвучиваю ответ")
+            self.speech_module.wait_until_speech_done(timeout=120)
+        finally:
+            self._manual_capture_active = False
+            self._set_wake_status("Ожидание wake word")
+
+    def open_output_device_dialog(self) -> None:
+        devices = self.speech_module.list_output_devices()
+        if not devices:
+            messagebox.showerror("Ошибка", "В системе нет доступных устройств вывода.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Устройство вывода озвучки")
+        dialog.geometry("740x280")
+        dialog.configure(bg="#dfe7f1")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        shell = ttk.Frame(dialog, style="DialogCard.TFrame", padding=18)
+        shell.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        ttk.Label(shell, text="Устройство вывода озвучки", style="TopTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            shell,
+            text=(
+                f"Текущее: {self.speech_module.get_output_device_label()}. "
+                "Для lip sync в Unreal выберите «CABLE Input (VB-Audio Virtual Cable)»."
+            ),
+            style="TopSub.TLabel",
+            wraplength=660,
+        ).pack(anchor="w", pady=(6, 14))
+
+        values = ["— | Системное устройство по умолчанию"] + [
+            f"{device['index']} | {device['name']} | {device['default_sample_rate']} Hz"
+            for device in devices
+        ]
+        selected_value = tk.StringVar()
+        current_index = self.speech_module.get_output_device_index()
+        selected_value.set(
+            next((value for value in values if value.startswith(f"{current_index} |")), values[0])
+        )
+
+        combo = ttk.Combobox(shell, textvariable=selected_value, values=values, state="readonly")
+        combo.pack(fill=tk.X)
+
+        buttons = ttk.Frame(shell, style="DialogCard.TFrame")
+        buttons.pack(fill=tk.X, pady=(18, 0))
+
+        def save_selection() -> None:
+            selection = selected_value.get().strip()
+            if not selection:
+                return
+            try:
+                head = selection.split("|", 1)[0].strip()
+                device_index = None if head == "—" else int(head)
+                self.speech_module.set_output_device(device_index)
+                self.settings["output_device_index"] = device_index
+                self._save_settings()
+                self._refresh_device_labels()
+            except Exception as error:
+                messagebox.showerror("Ошибка", f"Не удалось переключить устройство вывода: {error}")
+                return
+
+            self.add_message(
+                "system",
+                f"Озвучка выводится в: {self.speech_module.get_output_device_label()}",
+            )
+            self._set_status("Устройство вывода обновлено")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Сохранить", style="Primary.TButton", command=save_selection).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Отмена", style="Secondary.TButton", command=dialog.destroy).pack(
+            side=tk.RIGHT,
+            padx=(0, 8),
+        )
 
     def _available_supertonic_voices(self) -> list[str]:
         voices_dir = Path(__file__).resolve().parent / "supertonic-3-model" / "voice_styles"
@@ -589,6 +900,7 @@ class AssistantApp:
         Выполняется в рабочем потоке (не в потоке UI).
         """
         self.conversation_history.append({"role": "user", "content": user_text})
+        self._set_metahuman_state("thinking")
 
         tts_stream = self.speech_module.create_tts_stream() if self.speech_module.tts_available else None
         assembler = SentenceAssembler()
@@ -625,6 +937,11 @@ class AssistantApp:
         else:
             self.conversation_history.append({"role": "assistant", "content": answer})
 
+        # Если озвучки не будет, возвращаем аватара в idle сами;
+        # иначе это сделает on_speak_end после конца воспроизведения.
+        if tts_stream is None or error_text is not None or not answer:
+            self._set_metahuman_state("idle")
+
         self.root.after(0, self._end_assistant_message)
 
     def handle_send(self) -> None:
@@ -639,9 +956,15 @@ class AssistantApp:
         threading.Thread(target=self._stream_llm_round, args=(user_text,), daemon=True).start()
 
     def handle_voice_input(self) -> None:
+        # Barge-in: голосовой ввод должен сразу прерывать текущую озвучку.
+        self.speech_module.stop_speaking()
+        self.metahuman_bridge.speak_end()
         self._set_status("Слушаю ваш голос...")
+        self._set_metahuman_state("listening")
 
         def worker() -> None:
+            # Пока идёт ручная запись, wake-слушатель не должен трогать микрофон.
+            self._manual_capture_active = True
             try:
                 text = self.speech_module.speech_to_text()
 
@@ -655,13 +978,17 @@ class AssistantApp:
 
             except Exception as error:
                 error_message = str(error)
+                self._set_metahuman_state("idle")
                 self.root.after(0, lambda: self._set_status("Готово к работе"))
                 self.root.after(0, lambda: messagebox.showerror("Ошибка", error_message))
+            finally:
+                self._manual_capture_active = False
 
         threading.Thread(target=worker, daemon=True).start()
 
     def clear_chat(self) -> None:
         self.speech_module.stop_speaking()
+        self.metahuman_bridge.speak_end()
         self.conversation_history = [{"role": "system", "content": LM_CONFIG.system_prompt}]
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)
@@ -669,7 +996,9 @@ class AssistantApp:
         self._set_status("Диалог очищен")
 
     def on_close(self) -> None:
+        self.wake_listener.stop()
         self.speech_module.shutdown()
+        self.metahuman_bridge.shutdown()
         self.root.destroy()
 
 
@@ -682,9 +1011,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
 
 

@@ -10,6 +10,8 @@
 - локальное распознавание русской речи через faster-whisper (whisper-large-v3-turbo);
 - локальная озвучка ответов через Supertonic 3;
 - выбор микрофона из интерфейса;
+- выбор устройства вывода озвучки, включая `CABLE Input` для MetaHuman lip sync;
+- MetaHuman-мост: OSC-состояния диалога для Unreal Engine;
 - выбор голоса Supertonic из доступных `voice_styles`;
 - сохранение пользовательских настроек в `assistant_settings.json`;
 - диагностические скрипты для проверки микрофона и распознавания.
@@ -20,8 +22,9 @@
 app.py                    # tkinter-интерфейс ассистента
 lm_studio_module.py       # HTTP-клиент для LM Studio /v1
 speech_module.py          # Whisper STT, Supertonic TTS, работа с PyAudio
+metahuman_bridge.py       # OSC-мост для MetaHuman / Unreal Engine
 requirements.txt          # Python-зависимости
-assistant_settings.json   # локальные настройки микрофона и голоса
+assistant_settings.json   # локальные настройки микрофона, вывода, голоса и MetaHuman
 .env.example              # пример локальных переменных окружения
 check_mic.py              # список входных аудиоустройств
 test_mic.py               # диагностика микрофона и локального STT
@@ -108,7 +111,7 @@ SUPERTONIC_STEPS=8
 SUPERTONIC_SPEED=1.0
 ```
 
-Выбранные в интерфейсе микрофон и голос сохраняются в `assistant_settings.json` и применяются при следующем запуске.
+Выбранные в интерфейсе микрофон, устройство вывода, голос и состояние MetaHuman-моста сохраняются в `assistant_settings.json` и применяются при следующем запуске.
 
 `models/`, `supertonic-3-model/`, `.env` и `assistant_settings.json` считаются локальными файлами конкретного ПК и не должны попадать в Git.
 
@@ -146,10 +149,47 @@ Launcher использует проектное Windows-окружение `.ve
 - Введите сообщение в поле внизу и нажмите `Отправить` или `Enter`.
 - Нажмите `Голос`, чтобы записать короткую фразу с микрофона и отправить её модели.
 - Нажмите `Микрофон`, чтобы выбрать входное устройство.
+- Нажмите `Устройство вывода озвучки`, чтобы направить TTS в системный выход или в `CABLE Input`.
+- Нажмите `MetaHuman вкл/выкл`, чтобы включить отправку OSC-событий в Unreal Engine.
 - Нажмите `Выбрать голос`, чтобы сменить голос Supertonic.
 - Нажмите `Очистить`, чтобы сбросить текущую историю диалога.
 
 Ответ модели отображается в диалоге. Если Supertonic 3 доступен, ответ также озвучивается.
+
+## MetaHuman / Unreal Engine
+
+Для lip sync в UE используется двухканальная схема:
+
+- аудио: Supertonic TTS -> `CABLE Input (VB-Audio Virtual Cable)` -> `CABLE Output` -> MetaHuman Audio Source;
+- управление: `metahuman_bridge.py` -> OSC UDP `127.0.0.1:9000` -> Blueprint OSC Server.
+
+Настройка:
+
+1. Убедитесь, что VB-Cable установлен и Windows видит `CABLE Input` / `CABLE Output`.
+2. В приложении нажмите `Устройство вывода озвучки` и выберите `CABLE Input`.
+3. Нажмите `MetaHuman вкл/выкл`; в карточке MetaHuman должен появиться адрес `OSC 127.0.0.1:9000`.
+4. В UE включите плагины `OSC` и `MetaHuman Live Link`.
+5. В Blueprint создайте MetaHuman Audio Source от устройства `CABLE Output`.
+6. В Blueprint создайте OSC Server на `127.0.0.1:9000` и принимайте адреса:
+
+```text
+/state        string: idle | listening | thinking | speaking
+/speak_start
+/speak_end
+/emotion      string, float
+/gaze         float, float
+/gesture      string
+/curve        string, float
+/ping         int
+```
+
+Быстрый тест OSC без запуска ассистента:
+
+```powershell
+.\.venv-win\Scripts\python.exe metahuman_bridge.py
+```
+
+В UE Output Log должны появиться тестовые сообщения `/state`, `/speak_start`, `/emotion`, `/gaze`, `/speak_end`.
 
 ## Диагностика
 

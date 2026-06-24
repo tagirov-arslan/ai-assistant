@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
+import audioop
 import queue
 import re
 import tempfile
@@ -22,6 +23,18 @@ try:
     from supertonic import TTS as SupertonicTTS
 except ImportError:  # optional local TTS backend
     SupertonicTTS = None
+
+
+class SpeechError(RuntimeError):
+    """Базовая ошибка речевого модуля."""
+
+
+class MicrophoneError(SpeechError):
+    """Микрофон недоступен или не удалось прочитать аудио."""
+
+
+class SttUnavailableError(SpeechError):
+    """STT-движок недоступен или не смог распознать речь."""
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -81,6 +94,7 @@ class SpeechConfig:
     silence_limit_seconds: float = 0.45
     start_timeout_seconds: float = 5.0
     input_device_index: int | None = field(default_factory=lambda: _env_int("AI_ASSISTANT_INPUT_DEVICE_INDEX"))
+    output_device_index: int | None = field(default_factory=lambda: _env_int("AI_ASSISTANT_OUTPUT_DEVICE_INDEX"))
     stt_backend: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_STT_BACKEND", "faster_whisper").strip().lower() or "faster_whisper")
     whisper_model: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_MODEL", "").strip() or _default_whisper_model())
     whisper_device: str = field(default_factory=lambda: os.getenv("AI_ASSISTANT_WHISPER_DEVICE", "cpu").strip() or "cpu")
@@ -154,9 +168,15 @@ class TtsStream:
         self._text_queue: queue.Queue[str | None] = queue.Queue()
         self._wav_queue: queue.Queue[Path | None] = queue.Queue(maxsize=3)
         self.cancelled = threading.Event()
+        self.finished = threading.Event()
         self._closed = False
+        self._speak_notified = False
         threading.Thread(target=self._synth_worker, daemon=True).start()
         threading.Thread(target=self._play_worker, daemon=True).start()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Блокируется до полного завершения воспроизведения очереди."""
+        return self.finished.wait(timeout)
 
     def add(self, sentence: str) -> None:
         if sentence and sentence.strip() and not self.cancelled.is_set():
@@ -194,9 +214,16 @@ class TtsStream:
         while True:
             wav_path = self._wav_queue.get()
             if wav_path is None:
+                if self._speak_notified:
+                    self._speak_notified = False
+                    self._module._notify_speak_end()
+                self.finished.set()
                 return
             try:
                 if not self.cancelled.is_set():
+                    if not self._speak_notified:
+                        self._speak_notified = True
+                        self._module._notify_speak_start()
                     self._module._play_wav_audio(wav_path, extra_stop=self.cancelled)
             except Exception:
                 pass
@@ -225,22 +252,73 @@ class SpeechModule:
         self.whisper_model = None
         self.stt_available = self._is_stt_available()
         self.input_device_index, self.input_device_name, self.active_sample_rate = self._resolve_input_device()
+        self.output_device_index, self.output_device_name = self._resolve_output_device()
 
-    def speech_to_text(self) -> str:
+        # Колбэки для внешних потребителей (например, MetaHuman-моста):
+        # вызываются из рабочих потоков озвучки, не из потока UI.
+        self.on_speak_start: Callable[[], None] | None = None
+        self.on_speak_end: Callable[[], None] | None = None
+        self.on_audio_chunk: Callable[[bytes, int, int], None] | None = None
+
+    def speech_to_text(self, start_timeout: float | None = None) -> str:
         if self.stt_backend in {"faster_whisper", "whisper"}:
-            return self._speech_to_text_whisper()
+            return self._speech_to_text_whisper(start_timeout=start_timeout)
         raise RuntimeError(f"Неизвестный STT backend: {self.stt_backend}")
 
-    def _speech_to_text_whisper(self) -> str:
+    def _speech_to_text_whisper(self, start_timeout: float | None = None) -> str:
         if WhisperModel is None:
             raise RuntimeError("Пакет faster-whisper не установлен. Выполните: pip install faster-whisper")
         if self.input_device_index is None:
             raise RuntimeError("Микрофон не найден. Выберите доступное входное устройство.")
 
-        audio_bytes = self._record_phrase()
+        audio_bytes = self._record_phrase(start_timeout=start_timeout)
         if not audio_bytes:
             raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
 
+        result = self._transcribe_audio_bytes(audio_bytes)
+        if not result:
+            raise RuntimeError("Не удалось распознать речь через Whisper.")
+        return result
+
+    def recognize_short_phrase(
+        self,
+        *,
+        start_timeout: float = 2.5,
+        phrase_limit: float = 4.0,
+        silence_limit: float = 0.4,
+    ) -> str:
+        """Слушает короткое окно и возвращает распознанный текст ('' если тишина).
+
+        Используется wake-word детектором: на тишину не бросает исключение,
+        а на проблемы с устройством/STT — типизированные ошибки для статусов UI.
+        """
+        if not self.stt_available:
+            raise SttUnavailableError("STT-движок недоступен.")
+        if self.input_device_index is None:
+            raise MicrophoneError("Микрофон не найден.")
+
+        try:
+            audio_bytes = self._record_phrase(
+                start_timeout=start_timeout,
+                phrase_limit=phrase_limit,
+                silence_limit=silence_limit,
+                raise_on_silence=False,
+            )
+        except (MicrophoneError, SttUnavailableError):
+            raise
+        except Exception as error:
+            raise MicrophoneError(str(error)) from error
+
+        if not audio_bytes:
+            return ""
+
+        try:
+            return self._transcribe_audio_bytes(audio_bytes)
+        except Exception as error:
+            raise SttUnavailableError(str(error)) from error
+
+    def _transcribe_audio_bytes(self, audio_bytes: bytes) -> str:
+        """Пишет PCM во временный WAV, прогоняет через Whisper и схлопывает повторы."""
         temp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
@@ -254,10 +332,18 @@ class SpeechModule:
                 except OSError:
                     pass
 
-        result = self._collapse_repeated_phrase(text)
-        if not result:
-            raise RuntimeError("Не удалось распознать речь через Whisper.")
-        return result
+        return self._collapse_repeated_phrase(text)
+
+    def is_busy(self) -> bool:
+        """True, пока активный конвейер озвучки ещё не доиграл."""
+        stream = self._active_tts_stream
+        return stream is not None and not stream.finished.is_set()
+
+    def wait_until_speech_done(self, timeout: float | None = None) -> None:
+        """Блокируется, пока текущая озвучка не завершится (или не выйдет таймаут)."""
+        stream = self._active_tts_stream
+        if stream is not None:
+            stream.wait(timeout)
 
     def text_to_speech(self, text: str) -> None:
         if not text.strip():
@@ -267,7 +353,11 @@ class SpeechModule:
 
         with self.tts_lock:
             self.stop_playback_event.clear()
-            self._speak_supertonic(text)
+            self._notify_speak_start()
+            try:
+                self._speak_supertonic(text)
+            finally:
+                self._notify_speak_end()
 
     def text_to_speech_async(self, text: str) -> None:
         if not text.strip() or not self.tts_available:
@@ -381,6 +471,77 @@ class SpeechModule:
             )
         return devices
 
+    def list_output_devices(self) -> list[dict[str, object]]:
+        devices: list[dict[str, object]] = []
+        for index in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(index)
+            if int(info.get("maxOutputChannels", 0)) <= 0:
+                continue
+            devices.append(
+                {
+                    "index": index,
+                    "name": str(info.get("name", f"Device {index}")),
+                    "max_output_channels": int(info.get("maxOutputChannels", 0)),
+                    "default_sample_rate": int(float(info.get("defaultSampleRate", self.config.sample_rate))),
+                }
+            )
+        return devices
+
+    def set_output_device(self, device_index: int | None) -> None:
+        previous = self.config.output_device_index
+        self.config.output_device_index = device_index
+        try:
+            self.output_device_index, self.output_device_name = self._resolve_output_device(require_selected=True)
+        except Exception:
+            self.config.output_device_index = previous
+            self.output_device_index, self.output_device_name = self._resolve_output_device()
+            raise
+
+    def get_output_device_index(self) -> int | None:
+        return self.output_device_index
+
+    def get_output_device_label(self) -> str:
+        return self.output_device_name
+
+    def _resolve_output_device(self, require_selected: bool = False) -> tuple[int | None, str]:
+        if self.config.output_device_index is None:
+            return None, "Системное устройство по умолчанию"
+
+        for device in self.list_output_devices():
+            if device["index"] == self.config.output_device_index:
+                return int(device["index"]), str(device["name"])
+
+        if require_selected:
+            raise RuntimeError(
+                f"Устройство вывода с индексом {self.config.output_device_index} не найдено."
+            )
+        self.config.output_device_index = None
+        return None, "Системное устройство по умолчанию"
+
+    def _notify_speak_start(self) -> None:
+        callback = self.on_speak_start
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _notify_speak_end(self) -> None:
+        callback = self.on_speak_end
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _notify_audio_chunk(self, pcm: bytes, sample_rate: int, channels: int) -> None:
+        callback = self.on_audio_chunk
+        if callback is not None:
+            try:
+                callback(pcm, sample_rate, channels)
+            except Exception:
+                pass
+
     def _is_tts_available(self) -> bool:
         return SupertonicTTS is not None
 
@@ -400,18 +561,29 @@ class SpeechModule:
                     compute_type=self.config.whisper_compute_type,
                 )
 
-    def _record_phrase(self) -> bytes:
+    def _record_phrase(
+        self,
+        *,
+        start_timeout: float | None = None,
+        phrase_limit: float | None = None,
+        silence_limit: float | None = None,
+        raise_on_silence: bool = True,
+    ) -> bytes:
+        phrase_time_limit = self.config.phrase_time_limit_seconds if phrase_limit is None else phrase_limit
+        start_timeout_seconds = self.config.start_timeout_seconds if start_timeout is None else start_timeout
+        silence_limit_seconds = self.config.silence_limit_seconds if silence_limit is None else silence_limit
+
         max_chunks = max(
             1,
-            int(self.config.phrase_time_limit_seconds * self.active_sample_rate / self.config.chunk_size),
+            int(phrase_time_limit * self.active_sample_rate / self.config.chunk_size),
         )
         start_timeout_chunks = max(
             1,
-            int(self.config.start_timeout_seconds * self.active_sample_rate / self.config.chunk_size),
+            int(start_timeout_seconds * self.active_sample_rate / self.config.chunk_size),
         )
         silence_limit_chunks = max(
             1,
-            int(self.config.silence_limit_seconds * self.active_sample_rate / self.config.chunk_size),
+            int(silence_limit_seconds * self.active_sample_rate / self.config.chunk_size),
         )
 
         speech_started = False
@@ -441,7 +613,9 @@ class SpeechModule:
                     silence_chunks += 1
 
                 if not speech_started and index >= start_timeout_chunks:
-                    raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
+                    if raise_on_silence:
+                        raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
+                    return b""
 
                 if speech_started and silence_chunks >= silence_limit_chunks:
                     break
@@ -523,20 +697,41 @@ class SpeechModule:
             stream.stop_stream()
             stream.close()
 
-    def _play_pcm_audio(self, audio_bytes: bytes, sample_rate: int) -> None:
-        stream = self.audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=sample_rate,
+    def _open_output_stream(self, audio_format: int, channels: int, rate: int, frames_per_buffer: int):
+        """Открывает выходной поток. Если устройство выбрано явно, не откатывается молча на системное."""
+        if self.output_device_index is not None:
+            try:
+                return self.audio.open(
+                    format=audio_format,
+                    channels=channels,
+                    rate=rate,
+                    output=True,
+                    output_device_index=self.output_device_index,
+                    frames_per_buffer=frames_per_buffer,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"Не удалось открыть устройство вывода '{self.output_device_name}' "
+                    f"(index={self.output_device_index}, rate={rate}, channels={channels}). "
+                    f"Выберите другой CABLE Input в настройках озвучки. Ошибка PyAudio: {error}"
+                ) from error
+        return self.audio.open(
+            format=audio_format,
+            channels=channels,
+            rate=rate,
             output=True,
-            frames_per_buffer=2048,
+            frames_per_buffer=frames_per_buffer,
         )
+
+    def _play_pcm_audio(self, audio_bytes: bytes, sample_rate: int) -> None:
+        stream = self._open_output_stream(pyaudio.paInt16, 1, sample_rate, 2048)
         try:
             chunk_size = 4096
             for start in range(0, len(audio_bytes), chunk_size):
                 if self.stop_playback_event.is_set():
                     break
                 chunk = audio_bytes[start : start + chunk_size]
+                self._notify_audio_chunk(chunk, sample_rate, 1)
                 stream.write(chunk)
         finally:
             stream.stop_stream()
@@ -544,20 +739,63 @@ class SpeechModule:
 
     def _play_wav_audio(self, wav_path: Path, extra_stop: threading.Event | None = None) -> None:
         with wave.open(str(wav_path), "rb") as wav_file:
-            stream = self.audio.open(
-                format=self.audio.get_format_from_width(wav_file.getsampwidth()),
-                channels=wav_file.getnchannels(),
-                rate=wav_file.getframerate(),
-                output=True,
-                frames_per_buffer=1024,
-            )
+            source_width = wav_file.getsampwidth()
+            source_channels = wav_file.getnchannels()
+            source_rate = wav_file.getframerate()
+
+            if self.output_device_index is None:
+                stream = self._open_output_stream(
+                    self.audio.get_format_from_width(source_width),
+                    source_channels,
+                    source_rate,
+                    1024,
+                )
+                try:
+                    while not self.stop_playback_event.is_set():
+                        if extra_stop is not None and extra_stop.is_set():
+                            break
+                        chunk = wav_file.readframes(1024)
+                        if not chunk:
+                            break
+                        pcm_chunk = chunk if source_width == 2 else audioop.lin2lin(chunk, source_width, 2)
+                        self._notify_audio_chunk(pcm_chunk, source_rate, source_channels)
+                        stream.write(chunk)
+                finally:
+                    stream.stop_stream()
+                    stream.close()
+                return
+
+            device_info = self.audio.get_device_info_by_index(self.output_device_index)
+            target_rate = int(float(device_info.get("defaultSampleRate", source_rate)))
+            target_channels = min(2, max(1, int(device_info.get("maxOutputChannels", source_channels))))
+
+            pcm = wav_file.readframes(wav_file.getnframes())
+            if source_width != 2:
+                pcm = audioop.lin2lin(pcm, source_width, 2)
+                source_width = 2
+
+            if source_rate != target_rate:
+                pcm, _state = audioop.ratecv(pcm, source_width, source_channels, source_rate, target_rate, None)
+                source_rate = target_rate
+
+            if source_channels == 1 and target_channels == 2:
+                pcm = audioop.tostereo(pcm, source_width, 1.0, 1.0)
+                source_channels = 2
+            elif source_channels == 2 and target_channels == 1:
+                pcm = audioop.tomono(pcm, source_width, 0.5, 0.5)
+                source_channels = 1
+
+            stream = self._open_output_stream(pyaudio.paInt16, source_channels, source_rate, 1024)
             try:
-                while not self.stop_playback_event.is_set():
+                frame_width = source_width * source_channels
+                chunk_bytes = 1024 * frame_width
+                for start in range(0, len(pcm), chunk_bytes):
+                    if self.stop_playback_event.is_set():
+                        break
                     if extra_stop is not None and extra_stop.is_set():
                         break
-                    chunk = wav_file.readframes(1024)
-                    if not chunk:
-                        break
+                    chunk = pcm[start : start + chunk_bytes]
+                    self._notify_audio_chunk(chunk, source_rate, source_channels)
                     stream.write(chunk)
             finally:
                 stream.stop_stream()
@@ -697,3 +935,5 @@ class SpeechModule:
 
     def _normalize_text(self, text: str) -> str:
         return " ".join(text.strip().split()).lower()
+
+
