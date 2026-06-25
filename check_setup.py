@@ -131,6 +131,57 @@ def check_lm_studio() -> None:
         )
 
 
+def check_gpu() -> None:
+    """Сообщает о готовности GPU-ускорения (информационно, не блокирует)."""
+    # Какое устройство выбрано для Whisper в настройках.
+    device = "cpu"
+    settings = PROJECT_DIR / "assistant_settings.json"
+    if settings.exists():
+        try:
+            raw = json.loads(settings.read_text(encoding="utf-8"))
+            if isinstance(raw.get("whisper_device"), str):
+                device = raw["whisper_device"].strip().lower()
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Whisper GPU: ctranslate2 должен видеть CUDA-устройство + нужны cuBLAS/cuDNN.
+    try:
+        import ctranslate2
+
+        cuda_count = ctranslate2.get_cuda_device_count()
+    except Exception:
+        cuda_count = 0
+    cublas = importlib.util.find_spec("nvidia.cublas") is not None
+    cudnn = importlib.util.find_spec("nvidia.cudnn") is not None
+
+    if device == "cuda":
+        if cuda_count > 0 and cublas and cudnn:
+            report(OK, "Whisper GPU готов: CUDA-устройство видно, cuBLAS+cuDNN установлены.")
+        elif cuda_count == 0:
+            report(WARN, "whisper_device=cuda, но CUDA-устройство не видно. Будет ошибка/откат на CPU.")
+        else:
+            report(
+                WARN,
+                "whisper_device=cuda, но нет cuBLAS/cuDNN. Установите: "
+                "pip install -r requirements-gpu.txt",
+            )
+    else:
+        extra = " (есть CUDA — можно включить whisper_device=cuda)" if cuda_count > 0 else ""
+        report(OK, f"Whisper на CPU{extra}.")
+
+    # Supertonic GPU: нужен onnxruntime-gpu (CUDAExecutionProvider).
+    try:
+        import onnxruntime as ort
+
+        has_cuda_ep = "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        has_cuda_ep = False
+    if has_cuda_ep:
+        report(OK, "Supertonic GPU доступен (CUDAExecutionProvider). Включите supertonic_gpu=true.")
+    else:
+        report(OK, "Supertonic на CPU (для GPU нужен onnxruntime-gpu).")
+
+
 def check_settings() -> None:
     settings = PROJECT_DIR / "assistant_settings.json"
     if not settings.exists():
@@ -157,6 +208,7 @@ def main() -> int:
     check_python()
     check_dependencies()
     check_models()
+    check_gpu()
     check_lm_studio()
     check_settings()
 

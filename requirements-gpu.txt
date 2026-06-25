@@ -1,0 +1,15 @@
+# Дополнительные зависимости для ускорения на NVIDIA GPU (CUDA 12).
+# Ставить ПОВЕРХ основного requirements.txt и только при наличии видеокарты NVIDIA:
+#   .venv-win\Scripts\python.exe -m pip install -r requirements-gpu.txt
+#
+# Whisper (faster-whisper/ctranslate2) на GPU требует библиотек CUDA — cuBLAS и cuDNN.
+# Эти колёса кладут нужные DLL в site-packages\nvidia\*, а приложение само
+# добавляет их в PATH при whisper_device="cuda" (см. speech_module._register_cuda_dll_dirs).
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# Supertonic (ONNX) на GPU дополнительно требует GPU-сборку onnxruntime ВМЕСТО
+# обычной. Раскомментируйте две строки ниже и затем включите "supertonic_gpu": true
+# в assistant_settings.json. Без onnxruntime-gpu Supertonic тихо работает на CPU.
+# onnxruntime
+# onnxruntime-gpu

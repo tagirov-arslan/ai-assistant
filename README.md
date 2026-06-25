@@ -147,6 +147,48 @@ supertonic-3-model
 
 Если пакет или модель недоступны, чат продолжит работать без озвучивания.
 
+## Ускорение на GPU (NVIDIA)
+
+Распознавание (Whisper) и синтез (Supertonic) можно ускорить на видеокарте NVIDIA.
+Настройки задаются в `assistant_settings.json`.
+
+### 1. Whisper на GPU (самый большой выигрыш)
+
+На CPU STT занимает секунды, на GPU — около **0.1 с**.
+
+1. Установите CUDA-библиотеки (cuBLAS + cuDNN) поверх основных зависимостей:
+   ```powershell
+   .venv-win\Scripts\python.exe -m pip install -r requirements-gpu.txt
+   ```
+2. В `assistant_settings.json` укажите:
+   ```json
+   "whisper_device": "cuda",
+   "whisper_compute_type": "float16"
+   ```
+   (для экономии памяти можно `"int8_float16"`).
+
+Приложение само добавляет DLL из `nvidia-*-cu12` в `PATH` (см.
+`speech_module._register_cuda_dll_dirs`) — вручную PATH править не нужно. Если CUDA
+или библиотеки недоступны, будет ошибка загрузки — верните `"whisper_device": "cpu"`.
+Проверить готовность: `python check_setup.py`.
+
+### 2. Supertonic: меньше шагов + GPU
+
+- **Шаги диффузии** — главный рычаг скорости синтеза. В `assistant_settings.json`:
+  ```json
+  "supertonic_steps": 6
+  ```
+  Допустимо 5–12; 5–6 заметно быстрее 8 при незначительной потере качества.
+- **GPU для Supertonic (опционально)** требует GPU-сборку onnxruntime вместо
+  обычной. Раскомментируйте строки в `requirements-gpu.txt`, установите его и задайте:
+  ```json
+  "supertonic_gpu": true
+  ```
+  Без `onnxruntime-gpu` Supertonic тихо остаётся на CPU (приложение это сообщит).
+
+Требования: видеодрайвер NVIDIA и CUDA 12. Версии должны соответствовать вашей
+карте (для новых GPU нужны свежие сборки `onnxruntime-gpu`).
+
 ## Настройки окружения
 
 `speech_module.py` автоматически читает файл `.env` из корня проекта, если он существует. Скопируйте `.env.example` в `.env` и при необходимости измените значения:

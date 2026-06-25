@@ -2,6 +2,7 @@
 
 import os
 import audioop
+import io
 import queue
 import re
 import tempfile
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import perf
 import pyaudio
 
 try:
@@ -76,6 +78,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "y", "on", "да"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _default_whisper_model() -> str:
     """Local CTranslate2 build of whisper-large-v3-turbo, with hub fallback."""
     local_model = PROJECT_DIR / "whisper-large-v3-turbo-ct2"
@@ -90,8 +102,11 @@ class SpeechConfig:
     sample_rate: int = 16000
     chunk_size: int = 1024
     energy_threshold: int = 80
-    phrase_time_limit_seconds: float = 8.0
-    silence_limit_seconds: float = 0.45
+    # Длинные дефолты, чтобы НЕ обрывать речь пользователя: ассистент ждёт
+    # до 2.5 c тишины после фразы и допускает команды до 20 c.
+    # Влияет только на запись команды; wake/interrupt используют свои короткие окна.
+    phrase_time_limit_seconds: float = field(default_factory=lambda: _env_float("STT_PHRASE_TIME_LIMIT", 20.0))
+    silence_limit_seconds: float = field(default_factory=lambda: _env_float("STT_SILENCE_TIMEOUT", 2.5))
     start_timeout_seconds: float = 5.0
     input_device_index: int | None = field(default_factory=lambda: _env_int("AI_ASSISTANT_INPUT_DEVICE_INDEX"))
     output_device_index: int | None = field(default_factory=lambda: _env_int("AI_ASSISTANT_OUTPUT_DEVICE_INDEX"))
@@ -108,6 +123,9 @@ class SpeechConfig:
     supertonic_lang: str = field(default_factory=lambda: os.getenv("SUPERTONIC_LANG", "ru").strip() or "ru")
     supertonic_steps: int = field(default_factory=lambda: _env_int("SUPERTONIC_STEPS") or 8)
     supertonic_speed: float = field(default_factory=lambda: float(os.getenv("SUPERTONIC_SPEED", "1.0") or "1.0"))
+    # GPU для Supertonic (ONNX): требует onnxruntime-gpu + CUDA. При недоступности
+    # CUDA движок сам откатывается на CPU.
+    supertonic_gpu: bool = field(default_factory=lambda: _env_bool("SUPERTONIC_GPU", False))
 
 
 class SentenceAssembler:
@@ -247,6 +265,13 @@ class SpeechModule:
         self.supertonic_voice_style = None
         self._active_tts_stream: TtsStream | None = None
 
+        # Кэш заранее синтезированных коротких фраз ("Слушаю" и т.п.).
+        self._phrase_cache: dict[str, Path] = {}
+        # Замеры последней голосовой команды (заполняются в _speech_to_text_whisper).
+        self.last_record_finished_monotonic: float | None = None
+        self.last_record_seconds: float = 0.0
+        self.last_stt_seconds: float = 0.0
+
         self.tts_available = self._is_tts_available()
         self.stt_backend = self.config.stt_backend
         self.whisper_model = None
@@ -271,11 +296,20 @@ class SpeechModule:
         if self.input_device_index is None:
             raise RuntimeError("Микрофон не найден. Выберите доступное входное устройство.")
 
+        record_start = perf.now()
         audio_bytes = self._record_phrase(start_timeout=start_timeout)
+        self.last_record_finished_monotonic = perf.now()
+        self.last_record_seconds = self.last_record_finished_monotonic - record_start
+        perf.log("Command recording finished", self.last_record_seconds * 1000)
+
         if not audio_bytes:
             raise RuntimeError("Речь не обнаружена. Проверьте микрофон и попробуйте ещё раз.")
 
+        stt_start = perf.now()
         result = self._transcribe_audio_bytes(audio_bytes)
+        self.last_stt_seconds = perf.now() - stt_start
+        perf.log("STT recognition", self.last_stt_seconds * 1000)
+
         if not result:
             raise RuntimeError("Не удалось распознать речь через Whisper.")
         return result
@@ -318,20 +352,15 @@ class SpeechModule:
             raise SttUnavailableError(str(error)) from error
 
     def _transcribe_audio_bytes(self, audio_bytes: bytes) -> str:
-        """Пишет PCM во временный WAV, прогоняет через Whisper и схлопывает повторы."""
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_path = Path(temp_file.name)
-            self._write_wav(temp_path, audio_bytes, self.active_sample_rate)
-            text = self._transcribe_whisper_file(temp_path)
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
+        """Упаковывает PCM в WAV в памяти и прогоняет через Whisper (без диска)."""
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            wav_file.setframerate(self.active_sample_rate)
+            wav_file.writeframes(audio_bytes)
+        buffer.seek(0)
+        text = self._transcribe_whisper(buffer)
         return self._collapse_repeated_phrase(text)
 
     def is_busy(self) -> bool:
@@ -371,6 +400,59 @@ class SpeechModule:
 
         threading.Thread(target=runner, daemon=True).start()
 
+    # --- Кэш коротких фраз ("Слушаю", "Готово" и т.п.) -----------------
+
+    def _phrase_key(self, text: str) -> str:
+        return (
+            f"{self.config.supertonic_voice}|{self.config.supertonic_lang}|"
+            f"{self.config.supertonic_speed}|{self.config.supertonic_steps}|{text.strip().lower()}"
+        )
+
+    def prime_phrase(self, text: str) -> None:
+        """Заранее синтезирует короткую фразу в кэш, чтобы потом озвучить мгновенно."""
+        if not self.tts_available or not text.strip():
+            return
+        key = self._phrase_key(text)
+        with self.tts_lock:
+            cached = self._phrase_cache.get(key)
+            if cached is not None and cached.exists():
+                return
+            try:
+                self._phrase_cache[key] = self.synthesize_to_file(text)
+            except Exception:
+                return
+
+    def speak_cached(self, text: str) -> None:
+        """Озвучивает фразу из кэша (мгновенно), синтезируя при первом обращении.
+
+        Тем же голосом, что и обычные ответы (Supertonic, config.supertonic_voice).
+        """
+        if not text.strip():
+            return
+        if not self.tts_available:
+            raise RuntimeError("Supertonic 3 не настроен. Установите пакет supertonic.")
+        key = self._phrase_key(text)
+        with self.tts_lock:
+            self.stop_playback_event.clear()
+            path = self._phrase_cache.get(key)
+            if path is None or not path.exists():
+                path = self.synthesize_to_file(text)
+                self._phrase_cache[key] = path
+            self._notify_speak_start()
+            try:
+                self._play_wav_audio(path)
+            finally:
+                self._notify_speak_end()
+
+    def clear_phrase_cache(self) -> None:
+        """Сбрасывает кэш фраз (например, при смене голоса)."""
+        for path in self._phrase_cache.values():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._phrase_cache.clear()
+
     def stop_speaking(self) -> None:
         self.stop_playback_event.set()
         stream = self._active_tts_stream
@@ -409,6 +491,7 @@ class SpeechModule:
 
     def shutdown(self) -> None:
         self.stop_speaking()
+        self.clear_phrase_cache()
         self.audio.terminate()
 
     def get_tts_status_label(self) -> str:
@@ -550,11 +633,44 @@ class SpeechModule:
             return WhisperModel is not None
         return False
 
+    def _register_cuda_dll_dirs(self) -> None:
+        """Делает видимыми CUDA-DLL (cuBLAS/cuDNN) из pip-пакетов nvidia-*-cu12.
+
+        ctranslate2 на Windows ищет cublas64_12.dll / cudnn*.dll в PATH. Если CUDA
+        Toolkit не установлен глобально, но стоят колёса nvidia-cublas-cu12 /
+        nvidia-cudnn-cu12 — добавляем их bin-папки, чтобы не править PATH вручную.
+        """
+        if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+            return
+        site_packages = Path(__file__).resolve().parent / ".venv-win" / "Lib" / "site-packages"
+        roots = [site_packages] if site_packages.exists() else []
+        # На случай иного расположения venv — ищем nvidia/ в путях импорта.
+        try:
+            import nvidia  # type: ignore
+            roots.extend(Path(p).parent for p in nvidia.__path__)
+        except Exception:
+            pass
+        extra_paths: list[str] = []
+        for root in roots:
+            for bin_dir in root.glob("nvidia/*/bin"):
+                path_str = str(bin_dir)
+                extra_paths.append(path_str)
+                try:
+                    os.add_dll_directory(path_str)
+                except (OSError, FileNotFoundError):
+                    pass
+        # ctranslate2 грузит cublas64_12.dll по имени — для этого нужен PATH,
+        # одного add_dll_directory недостаточно.
+        if extra_paths:
+            os.environ["PATH"] = os.pathsep.join(extra_paths) + os.pathsep + os.environ.get("PATH", "")
+
     def _ensure_whisper_model(self) -> None:
         if WhisperModel is None:
             raise RuntimeError("Пакет faster-whisper не установлен. Выполните: pip install faster-whisper")
         with self.whisper_lock:
             if self.whisper_model is None:
+                if "cuda" in self.config.whisper_device.lower():
+                    self._register_cuda_dll_dirs()
                 self.whisper_model = WhisperModel(
                     self.config.whisper_model,
                     device=self.config.whisper_device,
@@ -622,17 +738,12 @@ class SpeechModule:
 
         return b"".join(frames)
 
-    def _write_wav(self, wav_path: Path, audio_bytes: bytes, sample_rate: int) -> None:
-        with wave.open(str(wav_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(audio_bytes)
-
-    def _transcribe_whisper_file(self, wav_path: Path) -> str:
+    def _transcribe_whisper(self, audio) -> str:
+        """audio: путь к WAV (str) или файлоподобный объект (io.BytesIO)."""
         self._ensure_whisper_model()
+        source = str(audio) if isinstance(audio, (str, Path)) else audio
         segments, _info = self.whisper_model.transcribe(
-            str(wav_path),
+            source,
             language=self.config.whisper_language,
             beam_size=max(1, self.config.whisper_beam_size),
             vad_filter=self.config.whisper_vad_filter,
@@ -642,10 +753,37 @@ class SpeechModule:
         )
         return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
 
+    def _enable_supertonic_gpu(self) -> None:
+        """Включает CUDAExecutionProvider для Supertonic.
+
+        SupertonicTTS не принимает device/providers, а список провайдеров в пакете
+        захардкожен на CPU. Поэтому подменяем DEFAULT_ONNX_PROVIDERS в загрузчике
+        до создания движка. Если CUDA-провайдер недоступен (нет onnxruntime-gpu),
+        загрузчик сам отфильтрует его и останется на CPU.
+        """
+        try:
+            import onnxruntime as ort
+            from supertonic import loader as supertonic_loader
+        except Exception as error:
+            print(f"[TTS] GPU недоступен, остаюсь на CPU: {error}", flush=True)
+            return
+        available = ort.get_available_providers()
+        if "CUDAExecutionProvider" not in available:
+            print(
+                "[TTS] onnxruntime-gpu/CUDA не найден — Supertonic на CPU. "
+                "Установите onnxruntime-gpu для ускорения.",
+                flush=True,
+            )
+            return
+        supertonic_loader.DEFAULT_ONNX_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        print("[TTS] Supertonic: включён CUDAExecutionProvider (GPU).", flush=True)
+
     def _ensure_supertonic_engine(self) -> None:
         if SupertonicTTS is None:
             raise RuntimeError("Пакет supertonic не установлен. Выполните: pip install supertonic")
         if self.supertonic_tts is None:
+            if self.config.supertonic_gpu:
+                self._enable_supertonic_gpu()
             self.supertonic_tts = SupertonicTTS(model_dir=self.config.supertonic_model_dir, auto_download=False)
         if self.supertonic_voice_style is None:
             self.supertonic_voice_style = self.supertonic_tts.get_voice_style(

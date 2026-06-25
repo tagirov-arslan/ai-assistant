@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
+import perf
 from lm_studio_module import LMStudioConfig, LMStudioModule
 from metahuman_bridge import MetaHumanBridge
 from speech_module import SentenceAssembler, SpeechConfig, SpeechModule
@@ -42,6 +43,17 @@ class AssistantApp:
 
         self.llm_module = LMStudioModule(LM_CONFIG)
         self.settings = self._load_settings()
+
+        # Производительность: замеры этапов обработки после записи.
+        perf.set_enabled(bool(self.settings.get("performance_log_enabled", True)))
+        # LLM: ограничение истории, чтобы промпт не рос без предела.
+        self.llm_max_history_messages = int(self.settings.get("llm_max_history_messages", 10))
+        LM_CONFIG.max_tokens = int(self.settings.get("llm_max_tokens", LM_CONFIG.max_tokens))
+        # Тайминг старта воспроизведения текущего ответа (для [Perf]).
+        self._answer_perf_start: float | None = None
+        self._answer_playback_logged = False
+        self._answer_llm_first_token_at: float | None = None
+
         self.speech_module = SpeechModule(self._build_speech_config())
         active_input_index = self.speech_module.get_input_device_index()
         if self.settings.get("input_device_index") != active_input_index:
@@ -54,10 +66,7 @@ class AssistantApp:
             enabled=bool(self.settings.get("metahuman_enabled", False)),
         )
         # Колбэки приходят из потоков озвучки — UI обновляем через root.after.
-        self.speech_module.on_speak_start = lambda: (
-            self.metahuman_bridge.speak_start(),
-            self.root.after(0, self._refresh_metahuman_label),
-        )
+        self.speech_module.on_speak_start = self._on_speak_start_hook
         self.speech_module.on_speak_end = lambda: (
             self.metahuman_bridge.speak_end(),
             self.root.after(0, self._refresh_metahuman_label),
@@ -132,6 +141,12 @@ class AssistantApp:
 
     def _on_models_ready(self) -> None:
         self._set_status("Готово к работе")
+        # Предсинтез фразы "Слушаю" в кэш, чтобы после wake word она звучала мгновенно.
+        if self.wake_reply_enabled and self.wake_reply_text:
+            threading.Thread(
+                target=lambda: self.speech_module.prime_phrase(self.wake_reply_text),
+                daemon=True,
+            ).start()
         self._start_wake_word_if_enabled()
 
     def _configure_styles(self) -> None:
@@ -254,7 +269,15 @@ class AssistantApp:
             "interrupt_words": list(DEFAULT_INTERRUPT_WORDS),
             "interrupt_by_wake_word": True,
             "interrupt_listen_during_tts": True,
-            "command_listen_timeout": 8.0,
+            "command_listen_timeout": 15.0,
+            "performance_log_enabled": True,
+            "llm_max_history_messages": 10,
+            "llm_max_tokens": LM_CONFIG.max_tokens,
+            # Ускорители. Whisper: "cpu"/"cuda" + "int8"/"float16"/"int8_float16".
+            # Supertonic GPU требует onnxruntime-gpu (иначе авто-откат на CPU).
+            "whisper_device": "cpu",
+            "whisper_compute_type": "int8",
+            "supertonic_gpu": False,
         }
 
     def _load_settings(self) -> dict[str, object]:
@@ -316,13 +339,25 @@ class AssistantApp:
             settings["interrupt_listen_during_tts"] = raw["interrupt_listen_during_tts"]
         if isinstance(raw.get("command_listen_timeout"), (int, float)) and raw["command_listen_timeout"] > 0:
             settings["command_listen_timeout"] = float(raw["command_listen_timeout"])
+        if isinstance(raw.get("performance_log_enabled"), bool):
+            settings["performance_log_enabled"] = raw["performance_log_enabled"]
+        if isinstance(raw.get("llm_max_history_messages"), int) and raw["llm_max_history_messages"] >= 0:
+            settings["llm_max_history_messages"] = raw["llm_max_history_messages"]
+        if isinstance(raw.get("llm_max_tokens"), int) and raw["llm_max_tokens"] > 0:
+            settings["llm_max_tokens"] = raw["llm_max_tokens"]
+        if isinstance(raw.get("whisper_device"), str) and raw["whisper_device"].strip():
+            settings["whisper_device"] = raw["whisper_device"].strip()
+        if isinstance(raw.get("whisper_compute_type"), str) and raw["whisper_compute_type"].strip():
+            settings["whisper_compute_type"] = raw["whisper_compute_type"].strip()
+        if isinstance(raw.get("supertonic_gpu"), bool):
+            settings["supertonic_gpu"] = raw["supertonic_gpu"]
         return settings
 
     def _save_settings(self) -> None:
         SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _build_speech_config(self) -> SpeechConfig:
-        return SpeechConfig(
+        config = SpeechConfig(
             input_device_index=(
                 self.settings.get("input_device_index")
                 if isinstance(self.settings.get("input_device_index"), int)
@@ -346,6 +381,17 @@ class AssistantApp:
                 else 1.0
             ),
         )
+        # Ускорители (GPU) — задаются из settings.json; если ключа нет, остаётся
+        # значение из .env / дефолт (CPU). Так настройка .env не перетирается молча.
+        device = self.settings.get("whisper_device")
+        if isinstance(device, str) and device.strip():
+            config.whisper_device = device.strip()
+        compute = self.settings.get("whisper_compute_type")
+        if isinstance(compute, str) and compute.strip():
+            config.whisper_compute_type = compute.strip()
+        if isinstance(self.settings.get("supertonic_gpu"), bool):
+            config.supertonic_gpu = self.settings["supertonic_gpu"]
+        return config
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, style="Root.TFrame", padding=18)
@@ -676,8 +722,18 @@ class AssistantApp:
             print(f"[Interrupt] Failed to stop TTS: {error}", flush=True)
         self._answer_done.set()
 
+    def _on_speak_start_hook(self) -> None:
+        """Старт воспроизведения речи: MetaHuman + замер задержки ответа."""
+        self.metahuman_bridge.speak_start()
+        if self._answer_perf_start is not None and not self._answer_playback_logged:
+            self._answer_playback_logged = True
+            if self._answer_llm_first_token_at is not None:
+                perf.log_since("Audio playback start (after first token)", self._answer_llm_first_token_at)
+            perf.log_since("Full processing after recording", self._answer_perf_start)
+        self.root.after(0, self._refresh_metahuman_label)
+
     def _speak_wake_reply(self) -> None:
-        """Короткий ответ-подтверждение ('Слушаю') через текущий TTS (блокирующе)."""
+        """Короткий ответ-подтверждение ('Слушаю') — из кэша TTS, мгновенно."""
         if not self.wake_reply_enabled:
             return
         reply = self.wake_reply_text
@@ -687,11 +743,15 @@ class AssistantApp:
         self._add_message_async("assistant", reply)
         if not self.speech_module.tts_available:
             return
+        reply_start = perf.now()
         try:
-            self.speech_module.text_to_speech(reply)
+            # speak_cached синтезирует один раз и далее проигрывает из кэша.
+            self.speech_module.speak_cached(reply)
         except Exception as error:
             self._set_wake_status("Ошибка TTS")
             print(f"[WakeWord] Reply TTS error: {error}", flush=True)
+            return
+        perf.log_since("Wake reply spoken", reply_start)
 
     def _answer_with_interrupt(self, text: str) -> str:
         """Генерирует и озвучивает ответ, слушая прерывание. Возвращает 'wake'|'stop'|'done'."""
@@ -700,6 +760,9 @@ class AssistantApp:
         self._answer_done = threading.Event()
         cancel_event = self._answer_cancel
         done_event = self._answer_done
+
+        # Якорь замеров: конец записи команды (обработка считается от него).
+        self._reset_answer_perf(self.speech_module.last_record_finished_monotonic)
 
         def worker() -> None:
             try:
@@ -760,19 +823,20 @@ class AssistantApp:
                 print("[WakeWord] Waiting for command...", flush=True)
 
                 # 2. Приём команды через полноценный STT.
+                # Пользователю даём договорить полностью (длинные таймауты записи).
                 self.root.after(0, lambda: self._set_status("Слушаю команду..."))
-                self._set_wake_status("Слушаю команду")
+                self._set_wake_status("Пользователь говорит")
                 self._set_metahuman_state("listening")
                 try:
-                    self._set_wake_status("Распознаю речь")
                     text = self.speech_module.speech_to_text(start_timeout=self.command_listen_timeout)
                 except Exception as error:
                     self._set_metahuman_state("idle")
-                    self.root.after(0, lambda: self._set_status("Готово к работе"))
+                    self.root.after(0, lambda: self._set_status("Готов"))
                     self._add_message_async("system", f"Команда не распознана: {error}")
                     self._set_wake_status("Ошибка STT")
                     break
 
+                self._set_wake_status("Команда записана")
                 print(f"[WakeWord] Command recognized: {text}", flush=True)
                 self._add_message_async("user", text)
                 self.root.after(0, lambda: self._set_status("Ассистент отвечает..."))
@@ -910,6 +974,13 @@ class AssistantApp:
             self.settings["supertonic_voice"] = voice
             self.speech_module.config.supertonic_voice = voice
             self.speech_module.supertonic_voice_style = None
+            # Кэш фраз привязан к голосу — сбрасываем и заново готовим "Слушаю".
+            self.speech_module.clear_phrase_cache()
+            if self.wake_reply_enabled and self.wake_reply_text:
+                threading.Thread(
+                    target=lambda: self.speech_module.prime_phrase(self.wake_reply_text),
+                    daemon=True,
+                ).start()
 
 
         def save_selection() -> None:
@@ -1051,6 +1122,19 @@ class AssistantApp:
         self._append_assistant_text("\n\n")
         self._set_status("Готово к работе")
 
+    def _trimmed_history(self) -> list[dict[str, str]]:
+        """История для LLM без локального system[0] и обрезанная до последних N сообщений."""
+        turns = self.conversation_history[1:]
+        if self.llm_max_history_messages > 0:
+            turns = turns[-self.llm_max_history_messages:]
+        return turns
+
+    def _reset_answer_perf(self, anchor: float | None) -> None:
+        """Готовит замеры под новый ответ. anchor — момент конца записи (или None)."""
+        self._answer_perf_start = anchor
+        self._answer_playback_logged = False
+        self._answer_llm_first_token_at = None
+
     def _stream_llm_round(self, user_text: str, cancel_event: threading.Event | None = None) -> None:
         """Стримит ответ LLM в чат и параллельно озвучивает готовые предложения.
 
@@ -1067,19 +1151,35 @@ class AssistantApp:
         error_text: str | None = None
         cancelled = False
 
+        # Замеры (от конца записи) и ограничение истории, чтобы промпт не рос.
+        proc_start = self._answer_perf_start if self._answer_perf_start is not None else perf.now()
+        first_token = True
+        first_sentence = True
+        history = self._trimmed_history()
+
         self.root.after(0, self._begin_assistant_message)
         try:
-            for piece in self.llm_module.ask_stream(self.conversation_history[1:]):
+            for piece in self.llm_module.ask_stream(history):
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
                     break
+                if first_token:
+                    first_token = False
+                    self._answer_llm_first_token_at = perf.now()
+                    perf.log_since("LLM response generation (first token)", proc_start)
                 chunks.append(piece)
                 self.root.after(0, lambda p=piece: self._append_assistant_text(p))
                 if tts_stream is not None:
                     for sentence in assembler.feed(piece):
+                        if first_sentence:
+                            first_sentence = False
+                            perf.log_since("TTS first sentence queued", proc_start)
                         tts_stream.add(sentence)
         except Exception as error:
             error_text = f"Ошибка обращения к модели: {error}"
+
+        if not cancelled and error_text is None:
+            perf.log_since("LLM response generation (full)", proc_start)
 
         answer = "".join(chunks).strip()
 
@@ -1122,6 +1222,8 @@ class AssistantApp:
         self.add_message("user", user_text)
         self._set_status("Ассистент отвечает...")
 
+        # Текстовый ввод: записи нет — замеры "после записи" не считаем.
+        self._reset_answer_perf(None)
         threading.Thread(target=self._stream_llm_round, args=(user_text,), daemon=True).start()
 
     def handle_voice_input(self) -> None:
@@ -1136,6 +1238,8 @@ class AssistantApp:
             self._manual_capture_active = True
             try:
                 text = self.speech_module.speech_to_text()
+                # Замеры обработки считаем от момента окончания записи.
+                self._reset_answer_perf(self.speech_module.last_record_finished_monotonic)
 
                 def process_voice() -> None:
                     self._clear_input()

@@ -27,5 +27,11 @@
   ],
   "interrupt_by_wake_word": true,
   "interrupt_listen_during_tts": true,
-  "command_listen_timeout": 8.0
+  "command_listen_timeout": 15.0,
+  "performance_log_enabled": true,
+  "llm_max_history_messages": 10,
+  "llm_max_tokens": 2000,
+  "whisper_device": "cpu",
+  "whisper_compute_type": "int8",
+  "supertonic_gpu": false
 }
